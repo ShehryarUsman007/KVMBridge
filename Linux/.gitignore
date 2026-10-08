@@ -1,0 +1,12 @@
+/target
+/node_modules
+/dist
+/src-tauri/gen
+*.kvmb-part
+.DS_Store
+
+# Tests are kept locally and not published
+/crates/*/tests/
+/src-tauri/tests/
+*.test.ts
+*.test.tsx

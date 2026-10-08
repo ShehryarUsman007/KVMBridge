@@ -1,0 +1,34 @@
+[package]
+name = "kvmbridge-core"
+description = "Protocol, crypto, discovery, layout and engine for KVM Bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+postcard.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+futures.workspace = true
+parking_lot.workspace = true
+snow = { version = "0.10", default-features = false, features = ["default-resolver", "use-aes-gcm", "use-chacha20poly1305", "use-blake2", "use-curve25519", "use-getrandom"] }
+serde_bytes = "0.11"
+socket2 = { version = "0.6", features = ["all"] }
+if-addrs = "0.15"
+directories = "6"
+hostname = "0.4"
+rand = "0.9"
+blake2 = "0.10"
+hex = "0.4"
+aes-gcm = "0.10"
+chacha20poly1305 = "0.10"
+argon2 = "0.5"
+
+[dev-dependencies]
+tempfile = "3"
+tracing-subscriber.workspace = true

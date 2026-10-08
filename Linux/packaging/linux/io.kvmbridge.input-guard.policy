@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <vendor>KVM Bridge</vendor>
+  <action id="io.kvmbridge.input-guard">
+    <description>Pause this computer's keyboard and mouse while another computer controls it</description>
+    <message>KVM Bridge wants to pause this computer's keyboard and mouse</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/bin/kvmbridge-input-guard</annotate>
+  </action>
+</policyconfig>

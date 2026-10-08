@@ -1,0 +1,58 @@
+# Builds the Linux packages (deb, rpm and AppImage) from the Linux folder.
+# Tags starting with "v" also attach them to a draft GitHub release.
+name: Linux
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths: ["Linux/**", ".github/workflows/linux.yml"]
+  pull_request:
+    paths: ["Linux/**", ".github/workflows/linux.yml"]
+  workflow_dispatch:
+
+defaults:
+  run:
+    working-directory: Linux
+
+jobs:
+  package:
+    # The oldest supported glibc, so the packages run on older systems too.
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: System libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: Linux -> target
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: Linux/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npx tauri build --bundles deb,rpm,appimage
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kvmbridge-linux
+          path: |
+            Linux/target/release/bundle/deb/*.deb
+            Linux/target/release/bundle/rpm/*.rpm
+            Linux/target/release/bundle/appimage/*.AppImage
+          if-no-files-found: error
+      - name: Draft release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: |
+            Linux/target/release/bundle/deb/*.deb
+            Linux/target/release/bundle/rpm/*.rpm
+            Linux/target/release/bundle/appimage/*.AppImage

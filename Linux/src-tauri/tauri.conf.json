@@ -1,0 +1,106 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "KVM Bridge",
+  "mainBinaryName": "kvmbridge",
+  "version": "0.1.0",
+  "identifier": "io.kvmbridge.app",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:1420",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build && npm run build:helper"
+  },
+  "app": {
+    "withGlobalTauri": false,
+    "windows": [
+      {
+        "label": "main",
+        "title": "KVM Bridge",
+        "width": 1120,
+        "height": 780,
+        "minWidth": 880,
+        "minHeight": 620,
+        "center": true,
+        "visible": false
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: asset:; connect-src ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": [
+      "deb",
+      "rpm",
+      "appimage",
+      "nsis",
+      "msi"
+    ],
+    "publisher": "KVM Bridge",
+    "category": "Utility",
+    "shortDescription": "Share one keyboard and mouse, the clipboard and files between computers",
+    "longDescription": "KVM Bridge lets several computers on the same network share a single keyboard and mouse. Move the cursor off the edge of one screen and it continues on the next computer. Clipboard contents and files (including drag and drop) move along, and all traffic is end-to-end encrypted with AES-256-GCM or ChaCha20-Poly1305.",
+    "copyright": "KVM Bridge contributors",
+    "license": "MIT OR Apache-2.0",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "linux": {
+      "deb": {
+        "section": "utils",
+        "files": {
+          "/usr/bin/kvmbridge-input-guard": "../target/release/kvmbridge-input-guard",
+          "/usr/share/polkit-1/actions/io.kvmbridge.input-guard.policy": "../packaging/linux/io.kvmbridge.input-guard.policy",
+          "/usr/share/mime/packages/kvmbridge.xml": "../packaging/linux/kvmbridge-mime.xml"
+        },
+        "depends": [
+          "pkexec | policykit-1"
+        ],
+        "desktopTemplate": "../packaging/linux/kvmbridge.desktop"
+      },
+      "rpm": {
+        "release": "1",
+        "files": {
+          "/usr/bin/kvmbridge-input-guard": "../target/release/kvmbridge-input-guard",
+          "/usr/share/polkit-1/actions/io.kvmbridge.input-guard.policy": "../packaging/linux/io.kvmbridge.input-guard.policy",
+          "/usr/share/mime/packages/kvmbridge.xml": "../packaging/linux/kvmbridge-mime.xml"
+        },
+        "depends": [
+          "polkit"
+        ],
+        "desktopTemplate": "../packaging/linux/kvmbridge.desktop"
+      },
+      "appimage": {
+        "bundleMediaFramework": false,
+        "files": {
+          "/usr/bin/kvmbridge-input-guard": "../target/release/kvmbridge-input-guard"
+        }
+      }
+    },
+    "windows": {
+      "webviewInstallMode": {
+        "type": "embedBootstrapper"
+      },
+      "nsis": {
+        "installMode": "perMachine",
+        "displayLanguageSelector": false
+      }
+    },
+    "fileAssociations": [
+      {
+        "ext": [
+          "kvmb"
+        ],
+        "name": "KVM Bridge configuration",
+        "description": "KVM Bridge configuration backup",
+        "mimeType": "application/x-kvmbridge-config",
+        "role": "Editor"
+      }
+    ]
+  }
+}
