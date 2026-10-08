@@ -3,10 +3,10 @@
 
 mod backup;
 mod clipboard;
-mod configs;
 mod dnd;
 mod input;
 mod peers;
+mod power;
 mod transfers;
 pub mod view;
 
@@ -17,7 +17,6 @@ use crate::layout::{Desktop, Layout};
 use crate::net::{self, CipherPolicy, NetCtx, NetEvent};
 use crate::platform::*;
 use crate::proto::{DeviceIntro, Msg, APP_VERSION, PROTOCOL_VERSION};
-use crate::library::{ConfigId, Library, StoredConfig};
 use crate::types::{os_tag, DeviceId, Edge};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -65,16 +64,6 @@ pub enum Command {
     SetController(Option<DeviceId>),
     /// Switch KVM Bridge on or off on this computer.
     SetEnabled(bool),
-    /// Save the current setup as a new config (`id: None`) or over one.
-    SaveConfig { name: String, id: Option<ConfigId> },
-    RenameConfig { id: ConfigId, name: String },
-    /// Load a saved config here and on its other computers.
-    LoadConfig(ConfigId),
-    DeleteConfig(ConfigId),
-    /// Copy a config file from elsewhere into the configs folder.
-    ImportConfigFile(PathBuf),
-    /// Re-read the configs folder.
-    RescanConfigs,
     /// Try pausing this computer's keyboard and mouse again (after setup).
     RetryInputPause,
     /// Diagnostics: drag a test file from here; it drops after `seconds`.
@@ -176,8 +165,6 @@ pub(crate) struct Engine {
     /// Pausing of this computer's own keyboard and mouse.
     guard: GuardStatus,
     guard_sent: Option<bool>,
-    library: Library,
-    configs: Vec<StoredConfig>,
     /// Peers we just paired with (merged into the arrangement on Hello).
     just_paired: std::collections::HashSet<DeviceId>,
     motion_deadline: Option<Instant>,
@@ -248,7 +235,6 @@ pub async fn start(paths: Paths, platform: Platform, overrides: Overrides) -> an
     let (notices, _) = broadcast::channel(64);
 
     let Platform { capture, emulation, clipboard, dnd } = platform;
-    let library = Library::new(paths.configs_dir());
     let mut engine = Engine {
         paths,
         st,
@@ -277,8 +263,6 @@ pub async fn start(paths: Paths, platform: Platform, overrides: Overrides) -> an
         capture_enabled: true,
         guard: GuardStatus::Off,
         guard_sent: None,
-        library,
-        configs: vec![],
         just_paired: Default::default(),
         motion_deadline: None,
         clip: ClipState::default(),
@@ -301,7 +285,6 @@ pub async fn start(paths: Paths, platform: Platform, overrides: Overrides) -> an
     let (snapshot_tx, snapshot_rx) = watch::channel(snap);
     engine.snapshot_tx = snapshot_tx;
     engine.seed_trusted_peers();
-    engine.reload_configs();
 
     let rx = Receivers {
         cmd: cmd_rx,
@@ -391,9 +374,6 @@ fn dummy_snapshot() -> Snapshot {
         },
         desktop: None,
         enabled: true,
-        active_config: None,
-        configs: vec![],
-        configs_dir: String::new(),
         guard: GuardStatus::Off,
         max_devices: config::MAX_DEVICES,
         searching: false,
@@ -536,22 +516,12 @@ impl Engine {
         match cmd {
             Command::SetSettings(s) => self.set_settings(*s),
             Command::SetCipher(c) => {
-                let shared =
-                    config::SharedSettings { rev: self.st.shared.rev + 1, author: self.me(), cipher: c };
+                let shared = config::SharedSettings { cipher: c, ..self.next_shared() };
                 self.adopt_shared(shared, None);
                 Ok(())
             }
             Command::SetController(c) => self.set_controller(c),
             Command::SetEnabled(on) => self.set_enabled(on),
-            Command::SaveConfig { name, id } => self.save_config(name, id),
-            Command::RenameConfig { id, name } => self.rename_config(id, name),
-            Command::LoadConfig(id) => self.load_config(id),
-            Command::DeleteConfig(id) => self.delete_config(id),
-            Command::ImportConfigFile(p) => self.import_config_file(p),
-            Command::RescanConfigs => {
-                self.reload_configs();
-                Ok(())
-            }
             Command::TestDrag { seconds } => self.test_drag(seconds.clamp(2, 30)),
             Command::RetryInputPause => {
                 self.guard_sent = None;
@@ -616,6 +586,23 @@ impl Engine {
             return Err("The release hotkey needs at least one key".into());
         }
         let old = std::mem::replace(&mut self.st.settings, s);
+        let common = config::CommonSettings::of(&self.st.settings);
+        if common != self.st.shared.common {
+            // Shared with every paired computer, right away.
+            let shared = config::SharedSettings { common, ..self.next_shared() };
+            self.adopt_shared(shared, None);
+        }
+        self.settings_changed(old);
+        Ok(())
+    }
+
+    /// A newer version of the shared settings, made here.
+    pub(crate) fn next_shared(&self) -> config::SharedSettings {
+        config::SharedSettings { rev: self.st.shared.rev + 1, author: self.me(), ..self.st.shared.clone() }
+    }
+
+    /// Put changed settings into effect (`old` were in use before).
+    pub(crate) fn settings_changed(&mut self, old: Settings) {
         let new = &self.st.settings;
         if old.device_name != new.device_name {
             let name = new.device_name.clone();
@@ -639,7 +626,6 @@ impl Engine {
         }
         self.save_now();
         self.mark_dirty();
-        Ok(())
     }
 
     fn identify(&mut self) {
@@ -687,14 +673,6 @@ impl Engine {
             backends: self.backends.clone(),
             desktop: self.desktop.clone(),
             enabled: self.st.enabled,
-            active_config: self.st.active_config.as_ref().map(|a| ActiveConfigView {
-                id: a.id,
-                name: a.name.clone(),
-                modified: self.active_config_modified(),
-                saved: self.stored_config(a.id).is_some(),
-            }),
-            configs: self.configs.iter().map(|c| self.config_view(c)).collect(),
-            configs_dir: self.library.dir().display().to_string(),
             guard: self.guard.clone(),
             max_devices: config::MAX_DEVICES,
             searching: self.searching_until.is_some(),

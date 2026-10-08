@@ -47,9 +47,6 @@ pub struct Inspection {
     pub devices: Vec<DeviceSummary>,
     /// The file was made on this very computer.
     pub from_this_device: bool,
-    /// The file is a saved config (not a backup); its name and id.
-    pub config: Option<String>,
-    pub config_id: Option<String>,
 }
 
 fn read(path: &str) -> Result<Vec<u8>, String> {
@@ -79,7 +76,6 @@ pub async fn config_export(state: State<'_, AppState>, path: String, options: Ex
         layout: options.layout.then(|| st.layout.clone()),
         devices: options.devices.then(|| st.trusted.clone()),
         identity,
-        profile: None,
     };
     let bytes = configfile::encode(&bundle, options.password.as_deref(), st.shared.cipher.resolve()).map_err(|e| e.to_string())?;
     let mut path = PathBuf::from(path);
@@ -104,21 +100,16 @@ pub async fn config_inspect(state: State<'_, AppState>, path: String, password: 
             needs_password: false,
             has_identity: b.identity.is_some(),
             from_this_device: b.info.source_id == me,
-            config: b.profile.as_ref().map(|p| p.name.clone()),
-            config_id: b.profile.as_ref().map(|p| p.id.to_string()),
             has_settings: b.settings.is_some(),
             has_shared: b.shared.is_some(),
             layout_screens: b.layout.as_ref().map(|l| l.slots.len()),
-            devices: match &b.profile {
-                Some(p) => p.members.iter().map(|m| DeviceSummary { id: m.id.to_string(), name: m.name.clone() }).collect(),
-                None => b
-                    .devices
-                    .clone()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|d| DeviceSummary { id: d.id.to_string(), name: d.name })
-                    .collect(),
-            },
+            devices: b
+                .devices
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|d| DeviceSummary { id: d.id.to_string(), name: d.name })
+                .collect(),
             info: Some(b.info),
         }),
         Err(BundleError::PasswordRequired) => Ok(Inspection {
@@ -131,8 +122,6 @@ pub async fn config_inspect(state: State<'_, AppState>, path: String, password: 
             layout_screens: None,
             devices: vec![],
             from_this_device: false,
-            config: None,
-            config_id: None,
         }),
         Err(e) => Err(e.to_string()),
     }

@@ -5,7 +5,6 @@ use crate::crypto::Cipher;
 use crate::layout::{Desktop, Layout};
 use crate::platform::BackendStatus;
 use crate::proto::{Capabilities, ItemMeta};
-use crate::library::ConfigId;
 use crate::platform::GuardStatus;
 use crate::types::DeviceId;
 use serde::{Deserialize, Serialize};
@@ -25,47 +24,12 @@ pub struct Snapshot {
     pub desktop: Option<Desktop>,
     /// KVM Bridge is switched on here.
     pub enabled: bool,
-    pub active_config: Option<ActiveConfigView>,
-    /// Saved configs (in the configs folder), sorted by name.
-    pub configs: Vec<ConfigView>,
-    /// Where configs are saved.
-    pub configs_dir: String,
     /// Pausing of this computer's keyboard and mouse.
     pub guard: GuardStatus,
     /// Most computers (including this one) that can be paired together.
     pub max_devices: usize,
     /// A search for devices on the network is running.
     pub searching: bool,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct ActiveConfigView {
-    pub id: ConfigId,
-    pub name: String,
-    /// The setup was changed since the config was saved.
-    pub modified: bool,
-    /// The config still exists in the configs folder.
-    pub saved: bool,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct ConfigView {
-    pub id: ConfigId,
-    pub name: String,
-    pub saved_ms: u64,
-    pub saved_by: String,
-    pub members: Vec<ConfigMemberView>,
-    /// Computer whose keyboard and mouse control the screens.
-    pub controller: Option<DeviceId>,
-    pub file: String,
-    /// It includes this computer (only then can it be loaded here).
-    pub includes_me: bool,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct ConfigMemberView {
-    pub id: DeviceId,
-    pub name: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -115,8 +79,6 @@ pub struct PeerView {
     pub pairing: Option<PairingView>,
     pub desktop: Option<Desktop>,
     pub caps: Capabilities,
-    /// Name of the config it runs.
-    pub config: Option<String>,
     pub error: Option<String>,
     pub last_seen_ms: Option<u64>,
 }

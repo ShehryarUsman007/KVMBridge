@@ -2,7 +2,6 @@
 
 use crate::AppState;
 use kvmbridge_core::config::Settings;
-use kvmbridge_core::library::ConfigId;
 use kvmbridge_core::crypto::CipherPreference;
 use kvmbridge_core::layout::Layout;
 use kvmbridge_core::types::DeviceId;
@@ -29,10 +28,6 @@ pub async fn set_settings(state: State<'_, AppState>, settings: Settings) -> R {
 #[tauri::command]
 pub async fn set_cipher(state: State<'_, AppState>, cipher: CipherPreference) -> R {
     state.engine.request(Command::SetCipher(cipher)).await
-}
-
-fn config_id(s: &str) -> R<ConfigId> {
-    s.parse().map_err(|_| format!("invalid config id {s:?}"))
 }
 
 /// The computer whose keyboard and mouse control all screens (`None`: any).
@@ -65,58 +60,6 @@ pub async fn test_drag(state: State<'_, AppState>) -> R {
 #[tauri::command]
 pub async fn retry_input_pause(state: State<'_, AppState>) -> R {
     state.engine.request(Command::RetryInputPause).await
-}
-
-#[tauri::command]
-pub async fn save_config(state: State<'_, AppState>, name: String, id: Option<String>) -> R {
-    let id = id.as_deref().map(config_id).transpose()?;
-    state.engine.request(Command::SaveConfig { name, id }).await
-}
-
-#[tauri::command]
-pub async fn rename_config(state: State<'_, AppState>, id: String, name: String) -> R {
-    state.engine.request(Command::RenameConfig { id: config_id(&id)?, name }).await
-}
-
-#[tauri::command]
-pub async fn load_config(state: State<'_, AppState>, id: String) -> R {
-    state.engine.request(Command::LoadConfig(config_id(&id)?)).await
-}
-
-#[tauri::command]
-pub async fn delete_config(state: State<'_, AppState>, id: String) -> R {
-    state.engine.request(Command::DeleteConfig(config_id(&id)?)).await
-}
-
-#[tauri::command]
-pub async fn import_config_file(state: State<'_, AppState>, path: String) -> R {
-    state.engine.request(Command::ImportConfigFile(PathBuf::from(path))).await
-}
-
-/// Save a copy of a config somewhere else (e.g. to move it by USB stick).
-#[tauri::command]
-pub fn export_config_file(state: State<'_, AppState>, id: String, path: String) -> R<String> {
-    let id = config_id(&id)?;
-    let snap = state.engine.snapshot();
-    let c = snap.configs.iter().find(|c| c.id == id).ok_or("That config no longer exists")?;
-    let mut dest = PathBuf::from(path);
-    if dest.extension().and_then(|e| e.to_str()) != Some(kvmbridge_core::configfile::EXTENSION) {
-        dest.set_extension(kvmbridge_core::configfile::EXTENSION);
-    }
-    std::fs::copy(&c.file, &dest).map_err(|e| format!("Cannot write {}: {e}", dest.display()))?;
-    Ok(dest.display().to_string())
-}
-
-#[tauri::command]
-pub async fn rescan_configs(state: State<'_, AppState>) -> R {
-    state.engine.request(Command::RescanConfigs).await
-}
-
-#[tauri::command]
-pub fn open_configs_dir(state: State<'_, AppState>) -> R {
-    let dir = state.paths.configs_dir();
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    tauri_plugin_opener::open_path(dir, None::<&str>).map_err(|e| e.to_string())
 }
 
 #[tauri::command]

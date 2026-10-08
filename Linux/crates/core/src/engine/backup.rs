@@ -58,7 +58,8 @@ impl Engine {
 
         if let Some(sh) = p.shared {
             let rev = self.st.shared.rev.max(sh.rev) + 1;
-            self.adopt_shared(SharedSettings { rev, author: me, cipher: sh.cipher }, None);
+            let common = crate::config::CommonSettings::of(&self.st.settings);
+            self.adopt_shared(SharedSettings { rev, author: me, cipher: sh.cipher, common }, None);
         }
 
         if let Some(mut l) = p.layout {

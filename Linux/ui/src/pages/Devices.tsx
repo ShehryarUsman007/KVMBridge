@@ -14,7 +14,7 @@ function OsIcon({ os }: { os: string }) {
 function statusText(p: PeerView): string {
   switch (p.status) {
     case "connected":
-      return p.caps.enabled ? (p.config ? `Connected · ${p.config}` : "Connected") : "Connected · switched off";
+      return p.caps.enabled ? "Connected" : "Connected · switched off";
     case "connecting":
       return "Connecting…";
     case "pairing":

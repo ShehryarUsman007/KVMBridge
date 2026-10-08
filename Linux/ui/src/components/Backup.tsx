@@ -146,41 +146,6 @@ export function ImportDialog({ path, onClose }: { path: string; onClose: () => v
   const info = inspection?.info;
   const locked = inspection?.needs_password;
 
-  if (inspection?.config && inspection.config_id) {
-    const id = inspection.config_id;
-    const name = inspection.config;
-    const add = async (load: boolean) => {
-      setBusy(true);
-      const ok = await run(api.importConfigFile(path), load ? undefined : `Added "${name}" to your configs`);
-      if (ok && load) await run(api.loadConfig(id), `Loaded "${name}"`);
-      setBusy(false);
-      if (ok) onClose();
-    };
-    return (
-      <div className="modal-backdrop" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
-        <div className="modal dialog" role="dialog" aria-modal="true" aria-labelledby="add-config-title">
-          <h2 id="add-config-title">Add the config "{name}"?</h2>
-          <p className="muted small mono">{fileName}</p>
-          <p className="muted">
-            It's saved from {info?.source_name ?? "another computer"} and covers {inspection.devices.length || "its"} computers.
-            Adding it copies it into your configs folder.
-          </p>
-          <div className="modal-actions end">
-            <button className="btn ghost" onClick={onClose}>
-              Cancel
-            </button>
-            <button className="btn" disabled={busy} onClick={() => add(false)}>
-              Add
-            </button>
-            <button className="btn primary" disabled={busy} onClick={() => add(true)}>
-              Add and load
-            </button>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
   return (
     <div className="modal-backdrop" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
       <div className="modal dialog" role="dialog" aria-modal="true" aria-labelledby="import-title">

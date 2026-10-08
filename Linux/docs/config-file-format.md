@@ -1,9 +1,7 @@
 # `.kvmb` — KVM Bridge configuration file format (version 1)
 
-A `.kvmb` file is either a **saved config** (a named setup that every
-computer in it keeps a copy of, in its configs folder) or a **backup** of
-one computer's configuration. It is a small binary container of
-typed sections. Section payloads are UTF-8 JSON so they stay readable when the
+A `.kvmb` file is a **backup** of one computer's configuration. It is a
+small binary container of typed sections. Section payloads are UTF-8 JSON so they stay readable when the
 file is not encrypted and tolerate added fields. All integers are big-endian.
 
 Implementation: `crates/core/src/configfile.rs`.
@@ -60,11 +58,11 @@ u16 type || u32 length || data[length]
 |-----:|-------------------------------------------------------------------------------|
 | 1    | **info** (required): `{created_ms, app_version, source_id, source_name, source_os, note}` |
 | 2    | **settings**: the device settings object (same shape as in `config.json`)    |
-| 3    | **shared settings**: `{rev, author, cipher}`                                  |
+| 3    | **shared settings**: `{rev, author, cipher, common}` (`common` since 0.1.4: the settings all paired computers share) |
 | 4    | **layout**: `{rev, author, slots: [{device, col, row, number, name}], controller}` |
 | 5    | **paired devices**: `[{id, name, public_key (hex), last_addr, paired_at_ms}]` |
 | 6    | **identity** (binary, encrypted files only): 16-byte device UUID followed by the 32-byte X25519 private key |
-| 7    | **config** (saved configs only): `{id, name, rev, saved_ms, saved_by, layout, cipher, members: [{id, name, public_key}]}` |
+| 7    | *saved config* (before 0.1.4; skipped now)                                   |
 
 Readers skip section types they do not know, so future versions can add
 sections without breaking older readers.
@@ -85,25 +83,3 @@ sections without breaking older readers.
     confirms their pairing automatically.
 * **Identity**: replaces this computer's device id and private key, then
   restarts KVM Bridge.
-
-## Saved configs
-
-A saved config holds the **info**, **settings** and **config** sections. The
-config section is the same on every member computer; the settings section
-holds the settings of the computer that stores the file, so loading the
-config restores that computer's own settings (except its name and
-appearance).
-
-* Default location: `<config dir>/configs/<name>.kvmb`
-  (Linux `~/.config/kvmbridge/configs`, Windows
-  `%APPDATA%\kvmbridge\KVMBridge\config\configs`).
-* Saving sends the config section to the other members over the encrypted
-  connection; members that are offline receive it when they reconnect.
-  Copies are ordered by `(rev, saved_ms, saved_by)`, newest wins. Deletions
-  are remembered (with a higher `rev`) so offline members do not bring a
-  deleted config back.
-* `members` carries each computer's public key: members of a config trust
-  each other when it is loaded.
-* `layout.controller` is the computer whose keyboard and mouse control all
-  screens; the other members pause their own keyboards and mice while it is
-  connected.

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { disable as autostartOff, enable as autostartOn, isEnabled as autostartEnabled } from "@tauri-apps/plugin-autostart";
 import { api, CipherPreference, inTauri, Settings, Timing } from "../api";
@@ -121,11 +121,42 @@ function HotkeyInput({ value, onChange }: { value: number[]; onChange: (v: numbe
   );
 }
 
+/** Marks settings that every paired computer shares. */
+function SharedNote() {
+  return <span className="muted small"> · all computers</span>;
+}
+
+/** A number field that applies its value when it loses focus or on Enter. */
+function PortInput({ value, onCommit }: { value: number; onCommit: (v: number) => void }) {
+  const [text, setText] = useState<string | null>(null);
+  const commit = () => {
+    const v = Number(text);
+    if (text !== null && Number.isInteger(v) && v >= 1 && v <= 65535 && v !== value) onCommit(v);
+    setText(null);
+  };
+  return (
+    <input
+      className="input mono"
+      type="number"
+      min={1}
+      max={65535}
+      value={text ?? value}
+      onChange={(e) => setText(e.target.value)}
+      onBlur={commit}
+      onKeyDown={(e) => e.key === "Enter" && commit()}
+    />
+  );
+}
+
 export function SettingsPage() {
   const { snap, run } = useEngine();
+  // The last change made here, shown until the engine's snapshot has it.
   const [draft, setDraft] = useState<Settings | null>(null);
+  const timer = useRef<number | null>(null);
+  const awaiting = useRef(false);
   const [autostart, setAutostart] = useState<boolean | null>(null);
   const [peersText, setPeersText] = useState<string | null>(null);
+  const [portsChanged, setPortsChanged] = useState(false);
   const [receiveDir, setReceiveDir] = useState("");
 
   useEffect(() => {
@@ -136,26 +167,34 @@ export function SettingsPage() {
     api.receiveDir().then(setReceiveDir).catch(() => {});
   }, [snap?.settings.transfers.receive_dir]);
 
+  useEffect(() => {
+    if (awaiting.current && timer.current === null) {
+      awaiting.current = false;
+      setDraft(null);
+    }
+  }, [snap?.settings]);
+  useEffect(() => () => {
+    if (timer.current !== null) window.clearTimeout(timer.current);
+  }, []);
+
   const s = draft ?? snap?.settings ?? null;
-  const dirty = useMemo(() => draft !== null && JSON.stringify(draft) !== JSON.stringify(snap?.settings), [draft, snap?.settings]);
   if (!snap || !s) return null;
 
-  const set = (patch: (d: Settings) => Settings) => setDraft(patch(structuredClone(s)));
-  const preset = Object.keys(PRESETS).find((k) => same(PRESETS[k], s.timing)) ?? "custom";
-  const restartNeeded = draft && (draft.listen_port !== snap.settings.listen_port || draft.discovery_port !== snap.settings.discovery_port);
-
-  const save = async () => {
-    if (!draft) return;
-    const next = structuredClone(draft);
-    if (peersText !== null) {
-      next.manual_peers = peersText.split(/[\s,]+/).map((x) => x.trim()).filter(Boolean);
-    }
-    const ok = await run(api.setSettings(next), restartNeeded ? "Saved. Restart KVM Bridge to use the new ports." : "Settings saved");
-    if (ok) {
-      setDraft(null);
-      setPeersText(null);
-    }
+  // Changes apply right away (sliders once they stop moving). Shared
+  // settings go to every connected computer as soon as the engine has them.
+  const set = (patch: (d: Settings) => Settings, delay = 0) => {
+    const next = patch(structuredClone(s));
+    setDraft(next);
+    if (timer.current !== null) window.clearTimeout(timer.current);
+    timer.current = window.setTimeout(async () => {
+      timer.current = null;
+      const ok = await run(api.setSettings(next));
+      if (ok) awaiting.current = true;
+      else setDraft(null);
+    }, delay);
   };
+  const slide = (patch: (d: Settings) => Settings) => set(patch, 300);
+  const preset = Object.keys(PRESETS).find((k) => same(PRESETS[k], s.timing)) ?? "custom";
 
   const chooseCipher = (c: CipherPreference) => {
     if (c === snap.shared.cipher) return;
@@ -167,7 +206,10 @@ export function SettingsPage() {
       <div className="page-header">
         <div>
           <h1>Settings</h1>
-          <p className="muted">These apply to this computer. Encryption is shared by all paired computers.</p>
+          <p className="muted">
+            Changes apply right away. Settings marked "all computers" are the same on every paired computer: changing
+            them here changes them everywhere.
+          </p>
         </div>
       </div>
 
@@ -184,12 +226,9 @@ export function SettingsPage() {
             <button
               key={v}
               role="radio"
-              aria-checked={snap.settings.appearance === v}
-              className={snap.settings.appearance === v ? "on" : ""}
-              onClick={() => {
-                if (draft) setDraft({ ...draft, appearance: v });
-                run(api.setSettings({ ...snap.settings, appearance: v }));
-              }}
+              aria-checked={s.appearance === v}
+              className={s.appearance === v ? "on" : ""}
+              onClick={() => set((d) => ({ ...d, appearance: v }))}
             >
               {label}
             </button>
@@ -198,7 +237,10 @@ export function SettingsPage() {
       </section>
 
       <section className="card settings-section">
-        <h2>Encryption</h2>
+        <h2>
+          Encryption
+          <SharedNote />
+        </h2>
         <p className="muted small">
           Input, clipboard and files are always encrypted. Keys are exchanged with X25519 (Noise protocol). Changing the
           cipher applies to every paired computer; they reconnect automatically.
@@ -230,7 +272,10 @@ export function SettingsPage() {
       </section>
 
       <section className="card settings-section">
-        <h2>Update intervals</h2>
+        <h2>
+          Update intervals
+          <SharedNote />
+        </h2>
         <p className="muted small">Shorter intervals feel more responsive; longer ones use less network and battery.</p>
         <div className="preset-row">
           {Object.keys(PRESETS).map((k) => (
@@ -252,7 +297,7 @@ export function SettingsPage() {
           step={1}
           format={(v) => (v === 0 ? "Every event" : `${v} ms (≈${Math.round(1000 / v)}/s)`)}
           hint="Mouse movement is batched and sent at most this often."
-          onChange={(v) => set((d) => ({ ...d, timing: { ...d.timing, motion_interval_us: v * 1000 } }))}
+          onChange={(v) => slide((d) => ({ ...d, timing: { ...d.timing, motion_interval_us: v * 1000 } }))}
         />
         <Slider
           label="Heartbeat interval"
@@ -262,7 +307,7 @@ export function SettingsPage() {
           step={100}
           format={(v) => (v < 1000 ? `${v} ms` : `${(v / 1000).toFixed(1)} s`)}
           hint="How often connected devices check that the other side is still there (also measures latency)."
-          onChange={(v) => set((d) => ({ ...d, timing: { ...d.timing, heartbeat_ms: v } }))}
+          onChange={(v) => slide((d) => ({ ...d, timing: { ...d.timing, heartbeat_ms: v } }))}
         />
         <Slider
           label="Missed heartbeats before disconnecting"
@@ -271,7 +316,7 @@ export function SettingsPage() {
           max={30}
           step={1}
           format={(v) => `${v} (≈${((v * s.timing.heartbeat_ms) / 1000).toFixed(1)} s)`}
-          onChange={(v) => set((d) => ({ ...d, timing: { ...d.timing, heartbeat_misses: v } }))}
+          onChange={(v) => slide((d) => ({ ...d, timing: { ...d.timing, heartbeat_misses: v } }))}
         />
         <Slider
           label="Clipboard check interval"
@@ -281,12 +326,15 @@ export function SettingsPage() {
           step={100}
           format={(v) => (v < 1000 ? `${v} ms` : `${(v / 1000).toFixed(1)} s`)}
           hint="Only used on systems that can't notify about clipboard changes."
-          onChange={(v) => set((d) => ({ ...d, timing: { ...d.timing, clipboard_poll_ms: v } }))}
+          onChange={(v) => slide((d) => ({ ...d, timing: { ...d.timing, clipboard_poll_ms: v } }))}
         />
       </section>
 
       <section className="card settings-section">
-        <h2>Clipboard</h2>
+        <h2>
+          Clipboard
+          <SharedNote />
+        </h2>
         <Toggle
           label="Share the clipboard"
           hint="Copy on one computer, paste on another."
@@ -306,14 +354,14 @@ export function SettingsPage() {
           max={256}
           step={1}
           format={(v) => formatBytes(v * 1024 * 1024)}
-          onChange={(v) => set((d) => ({ ...d, clipboard: { ...d.clipboard, max_bytes: v * 1024 * 1024 } }))}
+          onChange={(v) => slide((d) => ({ ...d, clipboard: { ...d.clipboard, max_bytes: v * 1024 * 1024 } }))}
         />
       </section>
 
       <section className="card settings-section">
         <h2>Files and drag and drop</h2>
         <Toggle
-          label="Drag and drop between screens"
+          label="Drag and drop between screens (all computers)"
           hint="Drag files from a file manager on one computer and drop them on another computer's screen."
           checked={s.transfers.drag_and_drop}
           onChange={(v) => set((d) => ({ ...d, transfers: { ...d.transfers, drag_and_drop: v } }))}
@@ -341,7 +389,10 @@ export function SettingsPage() {
       </section>
 
       <section className="card settings-section">
-        <h2>Shortcuts</h2>
+        <h2>
+          Shortcuts
+          <SharedNote />
+        </h2>
         <div className="field">
           <label className="field-label">Bring the cursor back to this computer</label>
           <HotkeyInput value={s.hotkeys.release} onChange={(v) => set((d) => ({ ...d, hotkeys: { ...d.hotkeys, release: v } }))} />
@@ -364,28 +415,26 @@ export function SettingsPage() {
         <div className="two-col">
           <div className="field">
             <label className="field-label">Connection port (TCP)</label>
-            <input
-              className="input mono"
-              type="number"
-              min={1}
-              max={65535}
+            <PortInput
               value={s.listen_port}
-              onChange={(e) => set((d) => ({ ...d, listen_port: Number(e.target.value) || d.listen_port }))}
+              onCommit={(v) => {
+                setPortsChanged(true);
+                set((d) => ({ ...d, listen_port: v }));
+              }}
             />
           </div>
           <div className="field">
             <label className="field-label">Discovery port (UDP)</label>
-            <input
-              className="input mono"
-              type="number"
-              min={1}
-              max={65535}
+            <PortInput
               value={s.discovery_port}
-              onChange={(e) => set((d) => ({ ...d, discovery_port: Number(e.target.value) || d.discovery_port }))}
+              onCommit={(v) => {
+                setPortsChanged(true);
+                set((d) => ({ ...d, discovery_port: v }));
+              }}
             />
           </div>
         </div>
-        {restartNeeded && <div className="notice warn small">Port changes take effect after restarting KVM Bridge. All devices must use the same discovery port.</div>}
+        {portsChanged && <div className="notice warn small">Port changes take effect after restarting KVM Bridge. All devices must use the same discovery port.</div>}
         <div className="field">
           <label className="field-label">Extra devices to contact directly</label>
           <textarea
@@ -393,9 +442,12 @@ export function SettingsPage() {
             rows={2}
             placeholder="192.168.1.20, laptop.local:47801"
             value={peersText ?? s.manual_peers.join(", ")}
-            onChange={(e) => {
-              setPeersText(e.target.value);
-              if (!draft) setDraft(structuredClone(s));
+            onChange={(e) => setPeersText(e.target.value)}
+            onBlur={() => {
+              if (peersText === null) return;
+              const list = peersText.split(/[\s,]+/).map((x) => x.trim()).filter(Boolean);
+              setPeersText(null);
+              if (list.join(",") !== s.manual_peers.join(",")) set((d) => ({ ...d, manual_peers: list }));
             }}
           />
         </div>
@@ -434,23 +486,6 @@ export function SettingsPage() {
         <BackupSection />
       </section>
 
-      {(dirty || peersText !== null) && (
-        <div className="save-bar">
-          <span>You have unsaved changes.</span>
-          <button
-            className="btn ghost"
-            onClick={() => {
-              setDraft(null);
-              setPeersText(null);
-            }}
-          >
-            Discard
-          </button>
-          <button className="btn primary" onClick={save}>
-            Save changes
-          </button>
-        </div>
-      )}
     </div>
   );
 }

@@ -2,11 +2,10 @@
 
 use crate::config::SharedSettings;
 use crate::layout::{Desktop, Layout};
-use crate::library::{Activation, ConfigStamp, SharedConfig};
 use crate::types::{ClipFormat, DeviceId, Point};
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 /// Maximum number of top-level entries described in offers / drag messages.
 pub const MAX_SUMMARY_ITEMS: usize = 64;
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -43,10 +42,6 @@ pub struct Hello {
     pub caps: Capabilities,
     /// Sender's heartbeat interval so the receiver can size its timeout.
     pub heartbeat_ms: u32,
-    /// Versions of the sender's saved configs (and deletions) for syncing.
-    pub configs: Vec<ConfigStamp>,
-    /// The config the sender runs.
-    pub active: Option<Activation>,
 }
 
 /// Metadata of one file or directory in a transfer. `rel_path` always uses `/`.
@@ -131,13 +126,6 @@ pub enum Msg {
     DragBegin { drag: u64, transfer: u64, items: Vec<ItemMeta> },
     DragCancel { drag: u64 },
     DragFinished { drag: u64, accepted: bool },
-
-    // ---- saved configs
-    /// A config the receiver is part of was saved (or the receiver lacks it).
-    ConfigSync(Box<SharedConfig>),
-    /// "Please load this config" (and switch on, if `activation.enable`).
-    ConfigActivate { config: Box<SharedConfig>, activation: Activation },
-    ConfigDelete(ConfigStamp),
 }
 
 impl Msg {

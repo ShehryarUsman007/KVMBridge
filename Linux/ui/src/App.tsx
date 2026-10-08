@@ -3,7 +3,6 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { api, inTauri } from "./api";
 import { useEngine } from "./store";
 import { ScreensPage } from "./pages/Screens";
-import { ConfigsPage } from "./pages/Configs";
 import { DevicesPage } from "./pages/Devices";
 import { TransfersPage } from "./pages/Transfers";
 import { SettingsPage } from "./pages/Settings";
@@ -14,7 +13,6 @@ import {
   IconAlert,
   IconCursor,
   IconDevices,
-  IconFolder,
   IconInfo,
   IconKeyboard,
   IconLock,
@@ -26,11 +24,10 @@ import {
   IconUnlock,
 } from "./components/Icons";
 
-type Page = "screens" | "configs" | "devices" | "transfers" | "settings" | "status";
+type Page = "screens" | "devices" | "transfers" | "settings" | "status";
 
 const NAV: { id: Page; label: string; icon: (p: { size?: number }) => JSX.Element }[] = [
   { id: "screens", label: "Screens", icon: IconScreens },
-  { id: "configs", label: "Configs", icon: IconFolder },
   { id: "devices", label: "Devices", icon: IconDevices },
   { id: "transfers", label: "Transfers", icon: IconTransfer },
   { id: "settings", label: "Settings", icon: IconSettings },
@@ -41,7 +38,6 @@ const NAV: { id: Page; label: string; icon: (p: { size?: number }) => JSX.Elemen
 function PowerSwitch() {
   const { snap, run } = useEngine();
   if (!snap) return null;
-  const cfg = snap.active_config;
   return (
     <div className="power">
       <label className={`power-toggle ${snap.enabled ? "on" : ""}`} title={snap.enabled ? "Turn KVM Bridge off on this computer" : "Turn KVM Bridge on"}>
@@ -56,12 +52,6 @@ function PowerSwitch() {
         </span>
         <span>{snap.enabled ? "On" : "Off"}</span>
       </label>
-      {cfg && (
-        <span className="power-config" title={cfg.modified ? "The setup changed since this config was saved" : "Active config"}>
-          {cfg.name}
-          {cfg.modified ? " (changed)" : ""}
-        </span>
-      )}
     </div>
   );
 }
@@ -271,7 +261,6 @@ export default function App() {
         <GuardBanner />
         <div className="content">
           {page === "screens" && <ScreensPage />}
-          {page === "configs" && <ConfigsPage />}
           {page === "devices" && <DevicesPage />}
           {page === "transfers" && <TransfersPage />}
           {page === "settings" && <SettingsPage />}

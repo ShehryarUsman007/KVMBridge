@@ -67,32 +67,21 @@ export interface Settings {
   appearance: "system" | "light" | "dark";
 }
 
+/** The parts of the settings that all paired computers share. */
+export interface CommonSettings {
+  strict_cipher: boolean;
+  timing: Timing;
+  clipboard: Settings["clipboard"];
+  drag_and_drop: boolean;
+  hotkeys: Settings["hotkeys"];
+}
+
+/** Settings that are the same on all paired computers (newest version wins). */
 export interface SharedSettings {
   rev: number;
   author: DeviceId;
   cipher: CipherPreference;
-}
-
-export type ConfigId = string;
-
-export interface ConfigView {
-  id: ConfigId;
-  name: string;
-  saved_ms: number;
-  saved_by: string;
-  members: { id: DeviceId; name: string }[];
-  controller: DeviceId | null;
-  file: string;
-  includes_me: boolean;
-}
-
-export interface ActiveConfigView {
-  id: ConfigId;
-  name: string;
-  /** The setup changed since the config was saved. */
-  modified: boolean;
-  /** The config still exists in the configs folder. */
-  saved: boolean;
+  common: CommonSettings;
 }
 
 /** Pausing of this computer's own keyboard and mouse. */
@@ -133,8 +122,6 @@ export interface PeerView {
   pairing: { sas: string; incoming: boolean; local_accepted: boolean; remote_accepted: boolean } | null;
   desktop: Desktop | null;
   caps: Capabilities;
-  /** Name of the config it runs. */
-  config: string | null;
   error: string | null;
   last_seen_ms: number | null;
 }
@@ -187,9 +174,6 @@ export interface Snapshot {
   backends: { capture: BackendStatus; emulation: BackendStatus; clipboard: BackendStatus; dnd: BackendStatus };
   desktop: Desktop | null;
   enabled: boolean;
-  active_config: ActiveConfigView | null;
-  configs: ConfigView[];
-  configs_dir: string;
   guard: GuardStatus;
   max_devices: number;
   /** A search for devices on the network is running. */
@@ -239,9 +223,6 @@ export interface Inspection {
   layout_screens: number | null;
   devices: { id: string; name: string }[];
   from_this_device: boolean;
-  /** The file is a saved config; its name and id. */
-  config: string | null;
-  config_id: string | null;
 }
 
 export interface AppInfo {
@@ -261,14 +242,6 @@ export const api = {
   setupInputPause: () => invoke<void>("setup_input_pause"),
   retryInputPause: () => invoke<void>("retry_input_pause"),
   testDrag: () => invoke<void>("test_drag"),
-  saveConfig: (name: string, id: ConfigId | null) => invoke<void>("save_config", { name, id }),
-  renameConfig: (id: ConfigId, name: string) => invoke<void>("rename_config", { id, name }),
-  loadConfig: (id: ConfigId) => invoke<void>("load_config", { id }),
-  deleteConfig: (id: ConfigId) => invoke<void>("delete_config", { id }),
-  importConfigFile: (path: string) => invoke<void>("import_config_file", { path }),
-  exportConfigFile: (id: ConfigId, path: string) => invoke<string>("export_config_file", { id, path }),
-  rescanConfigs: () => invoke<void>("rescan_configs"),
-  openConfigsDir: () => invoke<void>("open_configs_dir"),
   setLayout: (layout: Layout) => invoke<void>("set_layout", { layout }),
   pair: (device: DeviceId) => invoke<void>("pair", { device }),
   acceptPair: (device: DeviceId) => invoke<void>("accept_pair", { device }),

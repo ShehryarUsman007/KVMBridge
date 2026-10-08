@@ -13,8 +13,9 @@ the clipboard and files come along, and everything is encrypted.
   get in the way.
 * Shared clipboard (text, HTML, images and files), file transfers, and
   dragging files from one screen to another.
-* Saved configs: every computer in a config keeps a copy, and switching on
-  one computer asks the others to load it and switch on too.
+* One setup for all computers: the screen arrangement, the controlling
+  computer and the shared settings are kept on every paired computer, and a
+  change on one is sent to the others right away.
 * End-to-end encryption with AES-256-GCM or ChaCha20-Poly1305 (Noise
   protocol, verified with a 6-digit code when pairing).
 * Adjustable update intervals, to trade latency against CPU and network use.
@@ -86,8 +87,13 @@ bottom-right corner when the cursor moves on.
 3. **Choose the controlling computer.** Under **Keyboard and mouse**, pick
    the computer whose keyboard and mouse control everything. While it is
    connected, the other computers pause their own keyboards and mice.
-4. **Save a config.** On **Configs**, choose **Save current setup…**. The
-   config is copied to every computer in it.
+
+The arrangement, the controlling computer and the settings marked "all
+computers" (encryption, update intervals, clipboard, drag and drop and
+shortcuts) are stored on every paired computer. A change on one computer is
+sent to the connected ones at once; a computer that was offline catches up
+when it connects, and the newest change wins. A computer's name, ports,
+folder for received files and window preferences stay its own.
 
 ### The on/off switch
 
@@ -97,8 +103,6 @@ computer only. A computer that is off keeps running in the background:
 * If it was being controlled, the cursor moves to the nearest screen that is
   still on. Screens that are off are skipped when moving the cursor.
 * Its own keyboard and mouse work normally again.
-* Switching any computer of a config on asks the others to load that config
-  and switch on as well.
 
 ### Paused keyboards and mice
 
@@ -113,20 +117,12 @@ another computer controls this one. It only discards their input and never
 passes key presses on. The deb and rpm packages install it. The AppImage
 asks once for your password to set it up (**Set up** in the banner).
 
-### Configs
+### Backup
 
-Configs are saved in `~/.config/kvmbridge/configs/`. The Configs page shows
-the folder. A config holds:
-
-* the screen arrangement and the controlling computer;
-* the encryption choice;
-* the computers in it, with their keys, so they trust each other;
-* this computer's own settings.
-
-**Load** applies a config here and on its other computers. **Delete**
-removes it everywhere. Configs can also be copied as files (`.kvmb`), for
-example to a computer that has not been paired yet. The format is described
-in [docs/config-file-format.md](docs/config-file-format.md).
+**Settings → Backup and restore** saves the setup to a `.kvmb` file
+(optionally password protected) and loads it again, for example on a new
+computer. The format is described in
+[docs/config-file-format.md](docs/config-file-format.md).
 
 ### Clipboard, files and drag and drop
 
@@ -169,7 +165,7 @@ Layout of the code:
 
 | Path                 | What                                                            |
 |----------------------|-----------------------------------------------------------------|
-| `crates/core`        | Engine: discovery, encryption, pairing, input sharing, clipboard, transfers, configs |
+| `crates/core`        | Engine: discovery, encryption, pairing, input sharing, clipboard, transfers, settings sync |
 | `crates/platform`    | OS backends: Wayland portals (input capture, remote desktop, clipboard), keyboard/mouse pausing |
 | `src-tauri`          | Desktop app: window, tray, drag and drop (GTK), commands          |
 | `ui`                 | Interface (React + TypeScript)                                   |

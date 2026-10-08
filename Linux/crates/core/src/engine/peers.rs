@@ -5,7 +5,6 @@ use crate::config::{SharedSettings, TrustedPeer};
 use crate::crypto::{fingerprint, Cipher};
 use crate::net::ConnHandle;
 use crate::proto::{Capabilities, Hello};
-use crate::library::Activation;
 use crate::types::now_ms;
 
 pub(crate) const PAIRING_TIMEOUT: Duration = Duration::from_secs(180);
@@ -28,8 +27,6 @@ pub(crate) struct Peer {
     pub want_pair: bool,
     pub desktop: Option<Desktop>,
     pub caps: Capabilities,
-    /// The config it runs.
-    pub active: Option<Activation>,
     pub rtt_ms: Option<f32>,
     pub heartbeat_ms: u32,
     pub error: Option<String>,
@@ -54,7 +51,6 @@ impl Peer {
             want_pair: false,
             desktop: None,
             caps: Capabilities::default(),
-            active: None,
             rtt_ms: None,
             heartbeat_ms: 1000,
             error: None,
@@ -152,8 +148,6 @@ impl Engine {
             shared: self.st.shared.clone(),
             caps: self.caps(),
             heartbeat_ms: self.timing().heartbeat_ms,
-            configs: self.config_stamps(),
-            active: self.st.active_config.clone(),
         }))
     }
 
@@ -605,9 +599,6 @@ impl Engine {
             Msg::DragBegin { drag, transfer, items } => self.on_drag_begin(peer, drag, transfer, items),
             Msg::DragCancel { drag } => self.on_drag_cancel(peer, drag),
             Msg::DragFinished { drag, accepted } => self.on_drag_finished(peer, drag, accepted),
-            Msg::ConfigSync(c) => self.on_config_sync(peer, *c),
-            Msg::ConfigActivate { config, activation } => self.on_config_activate(peer, *config, activation),
-            Msg::ConfigDelete(t) => self.on_config_delete(peer, t),
             Msg::Ping { .. } | Msg::Pong { .. } | Msg::PairAccept | Msg::PairReject { .. } => {}
         }
     }
@@ -760,7 +751,6 @@ impl Engine {
             p.desktop = h.desktop.clone();
             p.caps = h.caps.clone();
             p.heartbeat_ms = h.heartbeat_ms.max(100);
-            p.active = h.active.clone();
         }
         self.on_peer_geometry(peer, h.desktop.clone());
         if h.shared.version() > self.st.shared.version() {
@@ -785,7 +775,6 @@ impl Engine {
             merged.author = me;
             self.adopt_layout(merged.normalized(), None);
         }
-        self.sync_configs_with(peer, &h.configs, h.active.as_ref());
         // Its screen may just have been switched off under our cursor.
         if matches!(&self.input, Input::Controlling(c) if c.target == peer) && !self.reachable(peer) {
             self.relocate_cursor();
@@ -847,9 +836,18 @@ impl Engine {
         Ok(())
     }
 
+    /// Take `s` as the shared settings (made here, or newer ones from `from`)
+    /// and pass them on to the other connected devices.
     pub(crate) fn adopt_shared(&mut self, s: SharedSettings, from: Option<DeviceId>) {
         let old_cipher = self.st.shared.cipher.resolve();
+        let old_settings = self.st.settings.clone();
+        s.common.apply_to(&mut self.st.settings);
         self.st.shared = s;
+        self.st.shared.common = crate::config::CommonSettings::of(&self.st.settings);
+        if old_settings != self.st.settings {
+            tracing::info!("shared settings changed{}", from.map(|f| format!(" on {}", self.peer_label(f))).unwrap_or_default());
+            self.settings_changed(old_settings);
+        }
         let new_cipher = self.st.shared.cipher.resolve();
         self.net.policy.write().preferred = new_cipher;
         self.broadcast_except(from, Msg::Shared(self.st.shared.clone()));
@@ -916,7 +914,6 @@ impl Engine {
             pairing,
             desktop: p.desktop.clone(),
             caps: p.caps.clone(),
-            config: p.active.as_ref().map(|a| a.name.clone()),
             error: p.error.clone(),
             last_seen_ms: p.last_seen.map(|t| t.elapsed().as_millis() as u64),
         }

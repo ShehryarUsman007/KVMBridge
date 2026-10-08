@@ -366,12 +366,6 @@ export function ScreensPage() {
                   {sel.isMe ? "This computer" : sel.status === "connected" ? "Connected" : sel.status === "off" ? "Connected, switched off" : "Offline"}
                   {sel.isMe && sel.status === "off" ? " (switched off)" : ""}
                 </dd>
-                {sel.peer?.config && (
-                  <>
-                    <dt>Config</dt>
-                    <dd>{sel.peer.config}</dd>
-                  </>
-                )}
                 {sel.peer?.address && (
                   <>
                     <dt>Address</dt>

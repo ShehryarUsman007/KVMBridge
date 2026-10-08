@@ -142,7 +142,8 @@ pub enum Appearance {
     Dark,
 }
 
-/// Settings local to this device.
+/// This device's settings. The parts in [`CommonSettings`] are the same on
+/// every paired device: changing them here changes them everywhere.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -193,17 +194,58 @@ pub fn default_device_name() -> String {
         .unwrap_or_else(|| "My computer".to_string())
 }
 
-/// Settings that are synchronised between all paired devices (newest wins).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// The parts of [`Settings`] that all paired devices share.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CommonSettings {
+    pub strict_cipher: bool,
+    pub timing: Timing,
+    pub clipboard: ClipboardSettings,
+    pub drag_and_drop: bool,
+    pub hotkeys: Hotkeys,
+}
+
+impl Default for CommonSettings {
+    fn default() -> Self {
+        CommonSettings::of(&Settings::default())
+    }
+}
+
+impl CommonSettings {
+    pub fn of(s: &Settings) -> CommonSettings {
+        CommonSettings {
+            strict_cipher: s.strict_cipher,
+            timing: s.timing.clone(),
+            clipboard: s.clipboard.clone(),
+            drag_and_drop: s.transfers.drag_and_drop,
+            hotkeys: s.hotkeys.clone(),
+        }
+    }
+
+    pub fn apply_to(&self, s: &mut Settings) {
+        s.strict_cipher = self.strict_cipher;
+        s.timing = self.timing.clone().sanitized();
+        s.clipboard = self.clipboard.clone();
+        s.transfers.drag_and_drop = self.drag_and_drop;
+        s.hotkeys = self.hotkeys.clone();
+    }
+}
+
+/// Settings that are the same on all paired devices. Every change gets a
+/// newer version and is sent to the connected devices; a device that was
+/// offline adopts the newest version when it connects.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SharedSettings {
     pub rev: u64,
     pub author: DeviceId,
     pub cipher: CipherPreference,
+    #[serde(default)]
+    pub common: CommonSettings,
 }
 
 impl SharedSettings {
     pub fn new(author: DeviceId) -> SharedSettings {
-        SharedSettings { rev: 0, author, cipher: CipherPreference::Auto }
+        SharedSettings { rev: 0, author, cipher: CipherPreference::Auto, common: CommonSettings::default() }
     }
 
     pub fn version(&self) -> (u64, DeviceId) {
@@ -238,15 +280,6 @@ pub struct State {
     /// KVM Bridge is switched on (sharing input, clipboard and drops).
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// When KVM Bridge was last switched off here (ms since the epoch).
-    #[serde(default)]
-    pub disabled_at_ms: u64,
-    /// The saved config this computer runs, if any.
-    #[serde(default)]
-    pub active_config: Option<crate::library::Activation>,
-    /// Configs deleted here (so offline computers do not bring them back).
-    #[serde(default)]
-    pub deleted_configs: Vec<crate::library::ConfigStamp>,
 }
 
 fn default_true() -> bool {
@@ -265,9 +298,6 @@ impl State {
             settings,
             trusted: vec![],
             enabled: true,
-            disabled_at_ms: 0,
-            active_config: None,
-            deleted_configs: vec![],
         }
     }
 
@@ -319,10 +349,6 @@ impl Paths {
     pub fn identity_file(&self) -> PathBuf {
         self.config_dir.join("identity.key")
     }
-    /// Default location of saved configs.
-    pub fn configs_dir(&self) -> PathBuf {
-        self.config_dir.join("configs")
-    }
     pub fn log_dir(&self) -> PathBuf {
         self.cache_dir.join("logs")
     }
@@ -335,6 +361,9 @@ pub fn load_state(paths: &Paths) -> anyhow::Result<State> {
         Ok(bytes) => match serde_json::from_slice::<State>(&bytes) {
             Ok(mut st) => {
                 st.settings.timing = st.settings.timing.clone().sanitized();
+                // The settings are what is in use (and files from before
+                // 0.1.4 have no copy in `shared`).
+                st.shared.common = CommonSettings::of(&st.settings);
                 Ok(st)
             }
             Err(e) => {

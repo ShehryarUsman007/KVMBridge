@@ -32,7 +32,6 @@ let snap: Snapshot = {
       pairing: null,
       desktop: { monitors: [{ x: 0, y: 0, w: 1920, h: 1200 }] },
       caps: { capture: true, emulation: true, clipboard: true, drag_and_drop: true, enabled: true },
-      config: "Desk",
       error: null,
       last_seen_ms: 400,
     },
@@ -49,7 +48,6 @@ let snap: Snapshot = {
       pairing: null,
       desktop: { monitors: [{ x: 0, y: 0, w: 2560, h: 1440 }] },
       caps: { capture: false, emulation: false, clipboard: false, drag_and_drop: false, enabled: false },
-      config: null,
       error: null,
       last_seen_ms: null,
     },
@@ -66,7 +64,6 @@ let snap: Snapshot = {
       pairing: null,
       desktop: null,
       caps: { capture: false, emulation: false, clipboard: false, drag_and_drop: false, enabled: false },
-      config: null,
       error: null,
       last_seen_ms: 900,
     },
@@ -95,7 +92,18 @@ let snap: Snapshot = {
     close_to_background: true,
     appearance: "system",
   },
-  shared: { rev: 1, author: me, cipher: "auto" },
+  shared: {
+    rev: 1,
+    author: me,
+    cipher: "auto",
+    common: {
+      strict_cipher: false,
+      timing: { motion_interval_us: 4000, heartbeat_ms: 1000, heartbeat_misses: 5, discovery_ms: 2000, clipboard_poll_ms: 500 },
+      clipboard: { enabled: true, files: true, max_bytes: 64 * 1024 * 1024 },
+      drag_and_drop: true,
+      hotkeys: { release: [29, 56, 42, 1], lock: [70] },
+    },
+  },
   effective_cipher: "aes-256-gcm",
   hw_aes: true,
   input: { mode: "local", locked: false },
@@ -137,36 +145,6 @@ let snap: Snapshot = {
   },
   desktop: { monitors: [{ x: 0, y: 0, w: 2560, h: 1440 }, { x: 2560, y: 180, w: 1920, h: 1080 }] },
   enabled: true,
-  active_config: { id: "c1", name: "Desk", modified: false, saved: true },
-  configs: [
-    {
-      id: "c1",
-      name: "Desk",
-      saved_ms: Date.now() - 3 * 3600_000,
-      saved_by: "desk-pc",
-      members: [
-        { id: me, name: "desk-pc" },
-        { id: laptop, name: "fedora-laptop" },
-      ],
-      controller: me,
-      file: "/home/max/.config/kvmbridge/configs/Desk.kvmb",
-      includes_me: true,
-    },
-    {
-      id: "c2",
-      name: "Office",
-      saved_ms: Date.now() - 6 * 86400_000,
-      saved_by: "office-win",
-      members: [
-        { id: me, name: "desk-pc" },
-        { id: office, name: "office-win" },
-      ],
-      controller: office,
-      file: "/home/max/.config/kvmbridge/configs/Office.kvmb",
-      includes_me: true,
-    },
-  ],
-  configs_dir: "/home/max/.config/kvmbridge/configs",
   guard: { state: "off" },
   max_devices: 5,
   searching: false,
@@ -222,42 +200,6 @@ export async function mockInvoke(cmd: string, args: Record<string, unknown> = {}
     case "set_enabled":
       update((s) => ({ ...s, enabled: Boolean(args.enabled) }));
       return null;
-    case "save_config":
-      update((s) => {
-        const id = (args.id as string | null) ?? `c${Date.now()}`;
-        const name = String(args.name);
-        const view = {
-          id,
-          name,
-          saved_ms: Date.now(),
-          saved_by: s.me.name,
-          members: s.layout.slots.map((x) => ({ id: x.device, name: x.name })),
-          controller: s.layout.controller,
-          file: `${s.configs_dir}/${name}.kvmb`,
-          includes_me: true,
-        };
-        const configs = [...s.configs.filter((c) => c.id !== id), view].sort((a, b) => a.name.localeCompare(b.name));
-        return { ...s, configs, active_config: { id, name, modified: false, saved: true } };
-      });
-      return null;
-    case "load_config":
-      update((s) => {
-        const c = s.configs.find((x) => x.id === args.id)!;
-        return { ...s, active_config: { id: c.id, name: c.name, modified: false, saved: true } };
-      });
-      return null;
-    case "rename_config":
-      update((s) => ({ ...s, configs: s.configs.map((c) => (c.id === args.id ? { ...c, name: String(args.name) } : c)) }));
-      return null;
-    case "delete_config":
-      update((s) => ({
-        ...s,
-        configs: s.configs.filter((c) => c.id !== args.id),
-        active_config: s.active_config?.id === args.id ? null : s.active_config,
-      }));
-      return null;
-    case "export_config_file":
-      return args.path;
     case "pair":
       update((s) => ({
         ...s,
@@ -293,8 +235,6 @@ export async function mockInvoke(cmd: string, args: Record<string, unknown> = {}
         layout_screens: 2,
         devices: [{ id: laptop, name: "fedora-laptop" }],
         from_this_device: true,
-        config: null,
-        config_id: null,
       };
     case "config_import":
       return { restarting: false };
