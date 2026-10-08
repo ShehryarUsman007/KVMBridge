@@ -136,6 +136,8 @@ pub(crate) enum Internal {
     TransferFinished { id: u64, result: Result<crate::transfer::Received, String> },
     ClipReadDone { peer: DeviceId, req: u64, format: crate::types::ClipFormat, data: Option<Vec<u8>> },
     DataOpened { peer: DeviceId, wire_id: u64, channel: Box<crate::net::DataChannel> },
+    /// Input capture was let go for drag probe `probe` a moment ago.
+    HandoffNudge { probe: u64 },
 }
 
 pub(crate) struct Engine {

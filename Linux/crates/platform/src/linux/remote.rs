@@ -349,7 +349,7 @@ impl Remote {
             }
             EiEvent::DeviceAdded(d) => {
                 let dev = d.device;
-                tracing::debug!(
+                tracing::info!(
                     "libei device {:?} type {:?} regions {:?}",
                     dev.name(),
                     dev.device_type(),
@@ -422,7 +422,16 @@ impl Remote {
     }
 
     fn frame(&self, d: &Device) {
-        d.device().frame(self.serial(), now_us());
+        if self.dev.emulating.contains(&dev_id(d)) {
+            d.device().frame(self.serial(), now_us());
+        }
+    }
+
+    /// `d`'s interface `T`, if events may be sent on it now. Events (or a
+    /// frame) for a device that is not emulating are a protocol error that
+    /// ends the whole session.
+    fn sendable<T: ei::Interface>(&self, d: &Device) -> Option<T> {
+        self.dev.emulating.contains(&dev_id(d)).then(|| d.interface::<T>()).flatten()
     }
 
     fn pointer_dev(&self) -> Option<Device> {
@@ -431,12 +440,12 @@ impl Remote {
 
     fn move_to(&mut self, p: Point) {
         if let Some(abs) = self.dev.abs.clone() {
-            if let Some(i) = abs.interface::<ei::PointerAbsolute>() {
+            if let Some(i) = self.sendable::<ei::PointerAbsolute>(&abs) {
                 i.motion_absolute(p.x as f32, p.y as f32);
                 self.frame(&abs);
             }
         } else if let Some(rel) = self.dev.rel.clone() {
-            if let Some(i) = rel.interface::<ei::Pointer>() {
+            if let Some(i) = self.sendable::<ei::Pointer>(&rel) {
                 match self.last {
                     Some(l) => i.motion_relative((p.x - l.x) as f32, (p.y - l.y) as f32),
                     None => {
@@ -468,22 +477,26 @@ impl Remote {
             }
             EmulationCommand::MoveRel { dx, dy } => {
                 self.ensure_emulating();
-                if let Some(rel) = self.dev.rel.clone() {
-                    if let Some(i) = rel.interface::<ei::Pointer>() {
+                let rel = self.dev.rel.clone();
+                match (rel.as_ref().and_then(|r| self.sendable::<ei::Pointer>(r)), self.last) {
+                    (Some(i), _) => {
                         i.motion_relative(dx as f32, dy as f32);
-                        self.frame(&rel);
+                        self.frame(rel.as_ref().expect("checked"));
+                        if let Some(l) = &mut self.last {
+                            l.x += dx;
+                            l.y += dy;
+                        }
                     }
-                }
-                if let Some(l) = &mut self.last {
-                    l.x += dx;
-                    l.y += dy;
+                    // No relative pointer: move the absolute one from where it was put.
+                    (None, Some(l)) => self.move_to(Point::new(l.x + dx, l.y + dy)),
+                    (None, None) => tracing::debug!("cannot move the pointer by ({dx}, {dy}): no relative pointer"),
                 }
             }
             EmulationCommand::Button { button, pressed } => {
                 // Also used outside a remote session (drag and drop).
                 self.ensure_emulating();
                 if let Some(d) = self.pointer_dev() {
-                    if let Some(i) = d.interface::<ei::Button>() {
+                    if let Some(i) = self.sendable::<ei::Button>(&d) {
                         i.button(button, if pressed { ei::button::ButtonState::Press } else { ei::button::ButtonState::Released });
                         self.frame(&d);
                         if pressed {
@@ -496,7 +509,7 @@ impl Remote {
             }
             EmulationCommand::Key { code, pressed } => {
                 if let Some(d) = self.dev.kbd.clone() {
-                    if let Some(i) = d.interface::<ei::Keyboard>() {
+                    if let Some(i) = self.sendable::<ei::Keyboard>(&d) {
                         i.key(code, if pressed { ei::keyboard::KeyState::Press } else { ei::keyboard::KeyState::Released });
                         self.frame(&d);
                         if pressed {
@@ -509,7 +522,7 @@ impl Remote {
             }
             EmulationCommand::Scroll { dx, dy } => {
                 if let Some(d) = self.pointer_dev() {
-                    if let Some(i) = d.interface::<ei::Scroll>() {
+                    if let Some(i) = self.sendable::<ei::Scroll>(&d) {
                         i.scroll(dx as f32, dy as f32);
                         self.frame(&d);
                     }
@@ -517,7 +530,7 @@ impl Remote {
             }
             EmulationCommand::ScrollDiscrete { dx, dy } => {
                 if let Some(d) = self.pointer_dev() {
-                    if let Some(i) = d.interface::<ei::Scroll>() {
+                    if let Some(i) = self.sendable::<ei::Scroll>(&d) {
                         i.scroll_discrete(dx, dy);
                         self.frame(&d);
                     }
@@ -543,8 +556,11 @@ impl Remote {
     }
 
     fn release_all(&mut self) {
+        if self.keys.is_empty() && self.buttons.is_empty() {
+            return;
+        }
         if let Some(d) = self.dev.kbd.clone() {
-            if let Some(i) = d.interface::<ei::Keyboard>() {
+            if let Some(i) = self.sendable::<ei::Keyboard>(&d) {
                 for k in self.keys.drain() {
                     i.key(k, ei::keyboard::KeyState::Released);
                 }
@@ -552,7 +568,7 @@ impl Remote {
             }
         }
         if let Some(d) = self.pointer_dev() {
-            if let Some(i) = d.interface::<ei::Button>() {
+            if let Some(i) = self.sendable::<ei::Button>(&d) {
                 for b in self.buttons.drain() {
                     i.button(b, ei::button::ButtonState::Released);
                 }

@@ -439,6 +439,7 @@ impl Engine {
             Internal::TransferFinished { id, result } => self.finish_transfer(id, result),
             Internal::ClipReadDone { peer, req, format, data } => self.on_clip_read_done(peer, req, format, data),
             Internal::DataOpened { peer, wire_id, channel } => self.on_data_opened(peer, wire_id, *channel),
+            Internal::HandoffNudge { probe } => self.nudge_handoff(probe),
         }
     }
 }

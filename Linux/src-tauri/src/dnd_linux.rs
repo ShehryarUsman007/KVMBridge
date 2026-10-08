@@ -40,10 +40,13 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 
 const URI_LIST: &str = "text/uri-list";
+/// How long a new window takes to be fully on screen (GNOME animates it in
+/// slightly shrunk, so its edges are not under the pointer before that).
+const SETTLE: Duration = Duration::from_millis(350);
 /// How long to wait for a drag to show up once the pointer has moved.
-const PROBE_WAIT: Duration = Duration::from_millis(400);
+const PROBE_WAIT: Duration = Duration::from_millis(500);
 /// How long a probe window may take to appear.
-const MAP_WAIT: Duration = Duration::from_millis(1500);
+const MAP_WAIT: Duration = Duration::from_millis(2000);
 /// How long to look for a leftover local drag once the cursor is home.
 const SINK_WAIT: Duration = Duration::from_millis(800);
 /// How long to wait for the injected press that starts a drag.
@@ -189,6 +192,7 @@ fn start_probe(id: u64, pos: Point, events: Events) {
                 !std::mem::replace(&mut s.requested, true)
             };
             if ask {
+                tracing::info!("drag probe: a drag came over the probe window; asking for its files");
                 w.drag_get_data(ctx, &gdk::Atom::intern(URI_LIST), time);
             }
             true
@@ -214,7 +218,7 @@ fn start_probe(id: u64, pos: Point, events: Events) {
         let st = st.clone();
         win.connect_map_event(move |_, _| {
             let st = st.clone();
-            glib::timeout_add_local_once(Duration::from_millis(50), move || {
+            glib::timeout_add_local_once(SETTLE, move || {
                 {
                     let mut s = st.borrow_mut();
                     if s.reported || std::mem::replace(&mut s.ready, true) {

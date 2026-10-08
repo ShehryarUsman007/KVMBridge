@@ -20,6 +20,9 @@ use crate::types::{Edge, Point};
 /// Longest time input capture stays let go for a probe. If the pointer has
 /// not been captured again by then, the cursor stays on this screen.
 const HANDOFF_TIMEOUT: Duration = Duration::from_secs(3);
+/// When to wiggle the pointer after letting go of capture (the release has
+/// to have reached the compositor, or the motion would be captured too).
+const NUDGE_AFTER: [u64; 2] = [80, 250];
 
 #[derive(Default)]
 pub(crate) struct DndState {
@@ -40,6 +43,8 @@ struct Handoff {
     /// Just inside the edge where the cursor left.
     at: Point,
     deadline: Instant,
+    /// This computer's own emulated pointer was used (to be reset after).
+    moved: bool,
 }
 
 struct OutDrag {
@@ -256,14 +261,41 @@ impl Engine {
         }
         tracing::info!("letting go of input for a moment so the drag here can be read");
         let _ = self.cap.send(CaptureCommand::Release { pos: Some(at) });
-        self.dnd.handoff = Some(Handoff { probe, edge: c.exit_edge, at, deadline: Instant::now() + HANDOFF_TIMEOUT });
+        self.dnd.handoff =
+            Some(Handoff { probe, edge: c.exit_edge, at, deadline: Instant::now() + HANDOFF_TIMEOUT, moved: false });
+        let internal = self.internal.clone();
+        tokio::spawn(async move {
+            for (i, ms) in NUDGE_AFTER.iter().enumerate() {
+                let since = if i == 0 { *ms } else { ms - NUDGE_AFTER[i - 1] };
+                tokio::time::sleep(Duration::from_millis(since)).await;
+                if internal.send(Internal::HandoffNudge { probe }).is_err() {
+                    return;
+                }
+            }
+        });
+    }
+
+    /// The warp alone only brings the drag *into* the probe window; GTK needs
+    /// a motion to report it. Move one pixel along the edge and back (never
+    /// towards it, which would capture input again).
+    pub(crate) fn nudge_handoff(&mut self, probe: u64) {
+        let Some(h) = self.dnd.handoff.as_mut().filter(|h| h.probe == probe) else { return };
+        if !matches!(self.input, Input::Controlling(_)) || self.dnd.probe != Some(probe) {
+            return;
+        }
+        h.moved = true;
+        let (nx, ny) = edge_normal(h.edge);
+        let (dx, dy) = (ny.abs(), nx.abs());
+        let _ = self.emu.send(EmulationCommand::MoveRel { dx, dy });
+        let _ = self.emu.send(EmulationCommand::MoveRel { dx: -dx, dy: -dy });
     }
 
     /// The probe is done while input is let go: cancel the local drag (if
     /// there is one) and push the pointer against the edge, so the barrier
     /// captures input again and the cursor carries on where it was.
     fn end_handoff_drag(&mut self, probe: u64, dragging: bool) {
-        let Some(h) = self.dnd.handoff.as_ref() else { return };
+        let Some(h) = self.dnd.handoff.as_mut() else { return };
+        h.moved = true;
         let esc = crate::types::keys::KEY_ESC;
         if dragging {
             let _ = self.emu.send(EmulationCommand::Key { code: esc, pressed: true });
@@ -280,15 +312,15 @@ impl Engine {
     /// Input was captured again after a handoff: carry on on the same screen.
     /// Returns false if there was no handoff.
     pub(crate) fn resume_after_handoff(&mut self, edge: Edge, pos: Point) -> bool {
-        if self.dnd.handoff.take().is_none() {
-            return false;
-        }
+        let Some(h) = self.dnd.handoff.take() else { return false };
         let Input::Controlling(c) = &mut self.input else { return false };
         tracing::info!("input is captured again");
         c.exit_edge = edge;
         c.exit_pos = pos;
-        // The pointer moves above were this computer's own emulation.
-        let _ = self.emu.send(EmulationCommand::Leave { park: None });
+        if h.moved {
+            // Stop this computer's own emulated pointer again.
+            let _ = self.emu.send(EmulationCommand::Leave { park: None });
+        }
         true
     }
 
@@ -314,7 +346,7 @@ impl Engine {
     /// The cursor is back on this screen: tell the backend how the drag
     /// that left it ended.
     pub(crate) fn flush_drag_outcome(&mut self) {
-        if self.dnd.handoff.take().is_some() {
+        if self.dnd.handoff.take().is_some_and(|h| h.moved) {
             let _ = self.emu.send(EmulationCommand::Leave { park: None });
         }
         if let Some((probe, outcome)) = self.dnd.held_outcome.take() {
