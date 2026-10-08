@@ -12,13 +12,16 @@
 //!   data, we wait until the files have arrived and hand it their local paths.
 //! * **Sending** (`Probe`): when a button held while the cursor left this
 //!   screen is let go elsewhere, a drop target is shown under the (frozen)
-//!   local pointer. A file drag in progress enters it, which tells us the
-//!   files. Mutter never saw that button being let go (input was captured),
-//!   so the local drag is still going on. When the cursor is back
-//!   (`ProbeDone`), windows are put on every monitor; if a drag shows up over
-//!   them it is cancelled with Escape, so nothing lands here by accident.
-//!   (Mutter ignores a button release from the emulated pointer when that
-//!   pointer never pressed the button, so releasing cannot end the drag.)
+//!   local pointer. Mutter only moves a drag onto a new window when the
+//!   pointer moves, so once it is mapped (`ProbeReady`) the engine lets go of
+//!   input capture with the pointer moved by a pixel. A file drag in progress
+//!   then enters the window, which tells us the files; the engine ends the
+//!   local drag with Escape and captures input again.
+//!   If the drag is still around when the cursor comes back (`ProbeDone`),
+//!   windows are put on every monitor; if it shows up over them it is
+//!   cancelled with Escape, so nothing lands here by accident. (Mutter
+//!   ignores a button release from the emulated pointer when that pointer
+//!   never pressed the button, so releasing cannot end the drag.)
 //!
 //! The windows are fully transparent; their CSS background is cleared too,
 //! or GTK tells the compositor they are opaque and they show up black.
@@ -37,8 +40,10 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 
 const URI_LIST: &str = "text/uri-list";
-/// How long to wait for a drag to show up under the probe window.
-const PROBE_WAIT: Duration = Duration::from_millis(800);
+/// How long to wait for a drag to show up once the pointer has moved.
+const PROBE_WAIT: Duration = Duration::from_millis(400);
+/// How long a probe window may take to appear.
+const MAP_WAIT: Duration = Duration::from_millis(1500);
 /// How long to look for a leftover local drag once the cursor is home.
 const SINK_WAIT: Duration = Duration::from_millis(800);
 /// How long to wait for the injected press that starts a drag.
@@ -138,6 +143,8 @@ struct ProbeState {
     seen: bool,
     requested: bool,
     reported: bool,
+    /// The window is on screen and `ProbeReady` went out.
+    ready: bool,
 }
 
 fn report(st: &Rc<RefCell<ProbeState>>, paths: Vec<PathBuf>) {
@@ -146,7 +153,7 @@ fn report(st: &Rc<RefCell<ProbeState>>, paths: Vec<PathBuf>) {
         return;
     }
     s.reported = true;
-    let _ = s.events.send(DndEvent::Probed { probe: s.id, paths });
+    let _ = s.events.send(DndEvent::Probed { probe: s.id, paths, dragging: s.seen });
 }
 
 fn close_probe_window(id: u64) {
@@ -165,7 +172,7 @@ fn start_probe(id: u64, pos: Point, events: Events) {
             w.close();
         }
     }
-    let st = Rc::new(RefCell::new(ProbeState { id, events, seen: false, requested: false, reported: false }));
+    let st = Rc::new(RefCell::new(ProbeState { id, events, seen: false, requested: false, reported: false, ready: false }));
     let win = overlay(Some(pos), None);
     win.drag_dest_set(
         gtk::DestDefaults::empty(),
@@ -194,7 +201,6 @@ fn start_probe(id: u64, pos: Point, events: Events) {
             let paths = parse_uri_list(&uris.join("\r\n"));
             tracing::info!("a drag leaving this screen carries {} item(s)", paths.len());
             report(&st, paths);
-            // The window has done its job; the drag stays with the app below.
             close_probe_window(id);
         });
     }
@@ -202,28 +208,56 @@ fn start_probe(id: u64, pos: Point, events: Events) {
         ctx.drag_finish(false, false, time);
         true
     });
+    {
+        // Once it is on screen, ask for the pointer to move, then give the
+        // drag a moment to come over.
+        let st = st.clone();
+        win.connect_map_event(move |_, _| {
+            let st = st.clone();
+            glib::timeout_add_local_once(Duration::from_millis(50), move || {
+                {
+                    let mut s = st.borrow_mut();
+                    if s.reported || std::mem::replace(&mut s.ready, true) {
+                        return;
+                    }
+                    let _ = s.events.send(DndEvent::ProbeReady { probe: id });
+                }
+                glib::timeout_add_local_once(PROBE_WAIT, move || probe_waited(st, id));
+            });
+            glib::Propagation::Proceed
+        });
+    }
     win.show_all();
     {
         let st = st.clone();
-        glib::timeout_add_local_once(PROBE_WAIT, move || {
-            let seen = st.borrow().seen;
-            if !seen {
-                tracing::info!("drag probe: no drag came over the probe window");
+        glib::timeout_add_local_once(MAP_WAIT, move || {
+            let pending = { let s = st.borrow(); !s.reported && !s.ready };
+            if pending {
+                tracing::info!("drag probe: the probe window did not appear");
                 report(&st, vec![]);
                 close_probe_window(id);
-                return;
             }
-            // A drag is there but its data is slow: give it a bit longer.
-            glib::timeout_add_local_once(Duration::from_millis(1500), move || {
-                if !st.borrow().reported {
-                    tracing::info!("drag probe: a drag is here but it did not hand over any files");
-                }
-                report(&st, vec![]);
-                close_probe_window(id);
-            });
         });
     }
     PROBE.with(|p| *p.borrow_mut() = Some(Probe { id, win: Some(win) }));
+}
+
+/// `PROBE_WAIT` after the pointer moved over the probe window.
+fn probe_waited(st: Rc<RefCell<ProbeState>>, id: u64) {
+    if !st.borrow().seen {
+        tracing::info!("drag probe: no drag came over the probe window");
+        report(&st, vec![]);
+        close_probe_window(id);
+        return;
+    }
+    // A drag is there but its data is slow: give it a bit longer.
+    glib::timeout_add_local_once(Duration::from_millis(1500), move || {
+        if !st.borrow().reported {
+            tracing::info!("drag probe: a drag is here but it did not hand over any files");
+        }
+        report(&st, vec![]);
+        close_probe_window(id);
+    });
 }
 
 fn finish_probe(id: u64, outcome: ProbeOutcome, events: Events) {
@@ -231,9 +265,12 @@ fn finish_probe(id: u64, outcome: ProbeOutcome, events: Events) {
     if let Some(w) = p.win {
         w.close();
     }
-    // Whatever the outcome, the button was let go on another screen.
     tracing::debug!("drag probe finished ({outcome:?})");
-    end_local_drag(events);
+    // Otherwise the button was let go on another screen, and the drag that
+    // went with it may still be going on here.
+    if outcome != ProbeOutcome::Cancelled {
+        end_local_drag(events);
+    }
 }
 
 /// The button of a local drag was let go on another screen, which the

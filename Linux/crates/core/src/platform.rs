@@ -143,8 +143,13 @@ pub enum ClipboardCommand {
 #[derive(Debug)]
 pub enum DndEvent {
     Status(BackendStatus),
+    /// The probe window of a [`DndCommand::Probe`] is on screen. The
+    /// compositor only hands it a drag in progress once the pointer moves,
+    /// which a captured pointer cannot: capture is let go for a moment.
+    ProbeReady { probe: u64 },
     /// Result of a [`DndCommand::Probe`]: files being dragged off this screen.
-    Probed { probe: u64, paths: Vec<PathBuf> },
+    /// `dragging`: a drag (of anything) was found, so it is still going on here.
+    Probed { probe: u64, paths: Vec<PathBuf>, dragging: bool },
     /// A local application accepted a drop of a remote drag; reply with the
     /// local paths once the files have arrived (`None` = failed).
     DropRequested { drag: u64, reply: oneshot::Sender<Option<Vec<PathBuf>>> },
@@ -168,13 +173,16 @@ pub enum ProbeOutcome {
     Returned,
     /// Nothing happened with it (control was released, etc.).
     Abandoned,
+    /// The local drag was already ended (or there was none): nothing to clean up.
+    Cancelled,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum DndCommand {
     /// A mouse button held while the cursor left this screen at `pos` was let
-    /// go on another screen: check whether a file drag is in progress here and
-    /// report it with [`DndEvent::Probed`].
+    /// go on another screen: put a probe window under the pointer, report
+    /// [`DndEvent::ProbeReady`], and then whether a file drag came over it
+    /// with [`DndEvent::Probed`].
     Probe { probe: u64, pos: Point },
     ProbeDone { probe: u64, outcome: ProbeOutcome },
     /// Start a native drag of not-yet-received files under the (remote

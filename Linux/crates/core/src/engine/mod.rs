@@ -480,6 +480,7 @@ impl Engine {
         }
         self.tick_transfers();
         self.tick_clipboard(now);
+        self.tick_dnd(now);
         if let Some(t) = self.save_at {
             if now >= t {
                 self.save_now();

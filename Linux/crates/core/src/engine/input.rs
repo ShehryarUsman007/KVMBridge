@@ -253,6 +253,9 @@ impl Engine {
     }
 
     fn on_activated(&mut self, edge: Edge, pos: Point) {
+        if self.st.enabled && self.resume_after_handoff(edge, pos) {
+            return;
+        }
         if self.controlled.is_some() || self.locked || !self.st.enabled || self.controlled_from_elsewhere() {
             let _ = self.cap.send(CaptureCommand::Release { pos: None });
             return;
