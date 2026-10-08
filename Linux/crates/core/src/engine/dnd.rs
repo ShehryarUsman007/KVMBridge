@@ -45,12 +45,13 @@ impl Engine {
         self.st.enabled && self.st.settings.transfers.drag_and_drop && self.backends.dnd.is_ready()
     }
 
-    /// The cursor just left this screen: forget an earlier probe.
+    /// The cursor just left this screen: an earlier probe is over. Its
+    /// outcome waits until the cursor is home again, because ending the local
+    /// drag needs input that is not captured.
     pub(crate) fn drag_crossed_out(&mut self) {
         if let Some(old) = self.dnd.probe.take() {
-            let _ = self.dndcmd.send(DndCommand::ProbeDone { probe: old, outcome: ProbeOutcome::Abandoned });
+            self.dnd.held_outcome = Some((old, ProbeOutcome::Abandoned));
         }
-        self.flush_drag_outcome();
     }
 
     /// `button` was held while the cursor left this screen and has just been
@@ -67,6 +68,7 @@ impl Engine {
         let Input::Controlling(c) = &self.input else { return false };
         // The local pointer is still where it left the screen.
         let pos = c.exit_pos;
+        tracing::info!("a button held across the edge was let go on {}; checking for a file drag", self.peer_label(c.target));
         let probe = crate::crypto::random_u64();
         self.dnd.probe = Some(probe);
         let _ = self.dndcmd.send(DndCommand::Probe { probe, pos });
@@ -82,7 +84,11 @@ impl Engine {
                 self.mark_dirty();
             }
             DndEvent::Probed { probe, paths } => {
-                if self.dnd.probe != Some(probe) || paths.is_empty() || self.dnd.outgoing.is_some() {
+                if self.dnd.probe != Some(probe) || self.dnd.outgoing.is_some() {
+                    return;
+                }
+                if paths.is_empty() {
+                    tracing::info!("no files were being dragged");
                     return;
                 }
                 let Input::Controlling(c) = &self.input else { return };
@@ -110,6 +116,14 @@ impl Engine {
             }
             DndEvent::InjectMove { dx, dy } => {
                 let _ = self.emu.send(EmulationCommand::MoveRel { dx, dy });
+            }
+            DndEvent::InjectEscape => {
+                // Never while input is captured: the key would go to another screen.
+                if !matches!(self.input, Input::Controlling(_)) {
+                    let esc = crate::types::keys::KEY_ESC;
+                    let _ = self.emu.send(EmulationCommand::Key { code: esc, pressed: true });
+                    let _ = self.emu.send(EmulationCommand::Key { code: esc, pressed: false });
+                }
             }
             DndEvent::DragEnded { drag, accepted } => {
                 let Some(d) = self.dnd.incoming.get_mut(&drag) else { return };

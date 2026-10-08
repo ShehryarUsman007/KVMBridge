@@ -13,9 +13,12 @@
 //! * **Sending** (`Probe`): when a button held while the cursor left this
 //!   screen is let go elsewhere, a drop target is shown under the (frozen)
 //!   local pointer. A file drag in progress enters it, which tells us the
-//!   files. When the cursor is back (`ProbeDone`) and the files were dropped
-//!   elsewhere, drop targets that decline are put on every monitor and the
-//!   local drag is ended on them, so nothing lands here by accident.
+//!   files. Mutter never saw that button being let go (input was captured),
+//!   so the local drag is still going on. When the cursor is back
+//!   (`ProbeDone`), windows are put on every monitor; if a drag shows up over
+//!   them it is cancelled with Escape, so nothing lands here by accident.
+//!   (Mutter ignores a button release from the emulated pointer when that
+//!   pointer never pressed the button, so releasing cannot end the drag.)
 //!
 //! The windows are fully transparent; their CSS background is cleared too,
 //! or GTK tells the compositor they are opaque and they show up black.
@@ -34,8 +37,10 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 
 const URI_LIST: &str = "text/uri-list";
-/// How long to wait for a drag to show up when the cursor leaves the screen.
-const PROBE_WAIT: Duration = Duration::from_millis(350);
+/// How long to wait for a drag to show up under the probe window.
+const PROBE_WAIT: Duration = Duration::from_millis(800);
+/// How long to look for a leftover local drag once the cursor is home.
+const SINK_WAIT: Duration = Duration::from_millis(800);
 /// How long to wait for the injected press that starts a drag.
 const PRESS_WAIT: Duration = Duration::from_millis(2000);
 
@@ -125,7 +130,6 @@ fn uri_target() -> gtk::TargetEntry {
 struct Probe {
     id: u64,
     win: Option<gtk::Window>,
-    st: Rc<RefCell<ProbeState>>,
 }
 
 struct ProbeState {
@@ -134,7 +138,6 @@ struct ProbeState {
     seen: bool,
     requested: bool,
     reported: bool,
-    files: bool,
 }
 
 fn report(st: &Rc<RefCell<ProbeState>>, paths: Vec<PathBuf>) {
@@ -143,7 +146,6 @@ fn report(st: &Rc<RefCell<ProbeState>>, paths: Vec<PathBuf>) {
         return;
     }
     s.reported = true;
-    s.files = !paths.is_empty();
     let _ = s.events.send(DndEvent::Probed { probe: s.id, paths });
 }
 
@@ -163,7 +165,7 @@ fn start_probe(id: u64, pos: Point, events: Events) {
             w.close();
         }
     }
-    let st = Rc::new(RefCell::new(ProbeState { id, events, seen: false, requested: false, reported: false, files: false }));
+    let st = Rc::new(RefCell::new(ProbeState { id, events, seen: false, requested: false, reported: false }));
     let win = overlay(Some(pos), None);
     win.drag_dest_set(
         gtk::DestDefaults::empty(),
@@ -206,18 +208,22 @@ fn start_probe(id: u64, pos: Point, events: Events) {
         glib::timeout_add_local_once(PROBE_WAIT, move || {
             let seen = st.borrow().seen;
             if !seen {
+                tracing::info!("drag probe: no drag came over the probe window");
                 report(&st, vec![]);
                 close_probe_window(id);
                 return;
             }
             // A drag is there but its data is slow: give it a bit longer.
             glib::timeout_add_local_once(Duration::from_millis(1500), move || {
+                if !st.borrow().reported {
+                    tracing::info!("drag probe: a drag is here but it did not hand over any files");
+                }
                 report(&st, vec![]);
                 close_probe_window(id);
             });
         });
     }
-    PROBE.with(|p| *p.borrow_mut() = Some(Probe { id, win: Some(win), st }));
+    PROBE.with(|p| *p.borrow_mut() = Some(Probe { id, win: Some(win) }));
 }
 
 fn finish_probe(id: u64, outcome: ProbeOutcome, events: Events) {
@@ -225,31 +231,33 @@ fn finish_probe(id: u64, outcome: ProbeOutcome, events: Events) {
     if let Some(w) = p.win {
         w.close();
     }
-    let files = p.st.borrow().files;
-    if !files || outcome == ProbeOutcome::Returned {
-        // Nothing to clean up, or the drag continues here.
-        return;
-    }
+    // Whatever the outcome, the button was let go on another screen.
+    tracing::debug!("drag probe finished ({outcome:?})");
     end_local_drag(events);
 }
 
-/// The files of the local drag went to another screen (or the drag was
-/// abandoned): end it on windows that decline the drop.
+/// The button of a local drag was let go on another screen, which the
+/// compositor did not see: if the drag is still going on here, cancel it.
 fn end_local_drag(events: Events) {
     close_sinks();
+    let done = Rc::new(std::cell::Cell::new(false));
     let n = gdk::Display::default().map(|d| d.n_monitors()).unwrap_or(1).max(1);
     let sinks: Vec<gtk::Window> = (0..n)
         .map(|i| {
             let w = overlay(None, Some(i));
             w.drag_dest_set(gtk::DestDefaults::empty(), &[uri_target()], gdk::DragAction::all());
-            w.connect_drag_motion(|_, ctx, _, _, time| {
+            let (done, events) = (done.clone(), events.clone());
+            w.connect_drag_motion(move |_, ctx, _, _, time| {
                 ctx.drag_status(gdk::DragAction::COPY, time);
+                if !done.replace(true) {
+                    tracing::info!("cancelling the drag left on this screen");
+                    let _ = events.send(DndEvent::InjectEscape);
+                    glib::timeout_add_local_once(Duration::from_millis(150), close_sinks);
+                }
                 true
             });
             w.connect_drag_drop(|_, ctx, _, _, time| {
-                tracing::debug!("ended the local drag (declined)");
                 ctx.drag_finish(false, false, time);
-                glib::timeout_add_local_once(Duration::from_millis(100), close_sinks);
                 true
             });
             w.show_all();
@@ -257,15 +265,12 @@ fn end_local_drag(events: Events) {
         })
         .collect();
     SINKS.with(|s| *s.borrow_mut() = sinks);
-    // Once they are on screen, make the compositor notice them and let go.
+    // Once they are on screen, make sure the compositor notices them.
     glib::timeout_add_local_once(Duration::from_millis(150), move || {
         let _ = events.send(DndEvent::InjectMove { dx: 1.0, dy: 0.0 });
         let _ = events.send(DndEvent::InjectMove { dx: -1.0, dy: 0.0 });
-        glib::timeout_add_local_once(Duration::from_millis(100), move || {
-            let _ = events.send(DndEvent::InjectButton { pressed: false });
-        });
     });
-    glib::timeout_add_local_once(Duration::from_millis(1500), close_sinks);
+    glib::timeout_add_local_once(SINK_WAIT, close_sinks);
 }
 
 fn close_sinks() {

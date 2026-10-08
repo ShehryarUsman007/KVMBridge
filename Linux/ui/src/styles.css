@@ -442,6 +442,16 @@ textarea.input {
   border: 1px dashed var(--border-strong);
   border-radius: var(--radius-lg);
 }
+.section-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 24px 0 8px;
+}
+.section-title h2 {
+  margin: 0;
+}
 .firewall-hint {
   margin-top: 8px;
   padding: 0 2px;

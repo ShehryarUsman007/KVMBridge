@@ -27,12 +27,17 @@ pub(crate) struct RemoteClip {
     pub seq: u64,
     pub offer: u64,
     pub formats: Vec<ClipFormat>,
+    /// Data already fetched for this offer (applications paste the same
+    /// content several times, and files should only travel once).
+    pub fetched: HashMap<ClipFormat, Vec<u8>>,
 }
 
 pub(crate) struct PendingPaste {
     pub peer: DeviceId,
+    pub seq: u64,
     pub format: ClipFormat,
-    pub reply: oneshot::Sender<Option<Vec<u8>>>,
+    /// Every local request waiting for this data.
+    pub replies: Vec<oneshot::Sender<Option<Vec<u8>>>>,
     pub started: Instant,
     /// Set once the data is coming through a transfer (no timeout then).
     pub transfer: Option<u64>,
@@ -45,7 +50,7 @@ impl Engine {
     }
 
     /// A peer's name for the log.
-    fn peer_label(&self, peer: DeviceId) -> String {
+    pub(crate) fn peer_label(&self, peer: DeviceId) -> String {
         self.peers.get(&peer).map_or_else(|| format!("{peer:?}"), |p| p.name.clone())
     }
 
@@ -83,14 +88,22 @@ impl Engine {
                     let _ = reply.send(None);
                     return;
                 };
+                if let Some(d) = r.fetched.get(&format) {
+                    let _ = reply.send(Some(d.clone()));
+                    return;
+                }
                 let (peer, seq) = (r.peer, r.seq);
+                if let Some(p) = self.clip.pending.values_mut().find(|p| p.peer == peer && p.seq == seq && p.format == format) {
+                    p.replies.push(reply);
+                    return;
+                }
                 tracing::info!("paste of {format:?} here; asking {}", self.peer_label(peer));
                 self.clip.next_req += 1;
                 let req = self.clip.next_req;
                 if self.send_to(peer, Msg::ClipRequest { req, seq, format }) {
                     self.clip.pending.insert(
                         req,
-                        PendingPaste { peer, format, reply, started: Instant::now(), transfer: None },
+                        PendingPaste { peer, seq, format, replies: vec![reply], started: Instant::now(), transfer: None },
                     );
                 } else {
                     let _ = reply.send(None);
@@ -111,7 +124,7 @@ impl Engine {
         tracing::info!("clipboard from {} ({formats:?}) is now available here", self.peer_label(peer));
         self.clip.next_offer += 1;
         let offer = self.clip.next_offer;
-        self.clip.remote = Some(RemoteClip { peer, seq, offer, formats: formats.clone() });
+        self.clip.remote = Some(RemoteClip { peer, seq, offer, formats: formats.clone(), fetched: HashMap::new() });
         self.clip.local = None;
         let _ = self.clipcmd.send(ClipboardCommand::AdvertiseRemote { offer, formats });
     }
@@ -161,15 +174,27 @@ impl Engine {
         }
     }
 
-    pub(crate) fn on_clip_data(&mut self, peer: DeviceId, req: u64, data: Option<Vec<u8>>) {
-        if let Some(p) = self.clip.pending.remove(&req) {
-            if p.peer == peer {
-                match &data {
-                    Some(d) => tracing::info!("received {} bytes of {:?} from {}", d.len(), p.format, self.peer_label(peer)),
-                    None => tracing::info!("{} had no {:?} to paste", self.peer_label(peer), p.format),
-                }
-                let _ = p.reply.send(data);
+    /// Answers every request waiting for `p`, keeping the data for later
+    /// pastes of the same offer.
+    fn finish_paste(&mut self, p: PendingPaste, data: Option<Vec<u8>>) {
+        if let (Some(d), Some(r)) = (&data, self.clip.remote.as_mut()) {
+            if r.peer == p.peer && r.seq == p.seq {
+                r.fetched.insert(p.format, d.clone());
             }
+        }
+        for reply in p.replies {
+            let _ = reply.send(data.clone());
+        }
+    }
+
+    pub(crate) fn on_clip_data(&mut self, peer: DeviceId, req: u64, data: Option<Vec<u8>>) {
+        if self.clip.pending.get(&req).is_some_and(|p| p.peer == peer) {
+            let p = self.clip.pending.remove(&req).expect("checked");
+            match &data {
+                Some(d) => tracing::info!("received {} bytes of {:?} from {}", d.len(), p.format, self.peer_label(peer)),
+                None => tracing::info!("{} had no {:?} to paste", self.peer_label(peer), p.format),
+            }
+            self.finish_paste(p, data);
         }
     }
 
@@ -194,8 +219,7 @@ impl Engine {
                 None
             }
         };
-        let _ = p.format;
-        let _ = p.reply.send(data);
+        self.finish_paste(p, data);
     }
 
     pub(crate) fn tick_clipboard(&mut self, now: Instant) {
@@ -208,7 +232,7 @@ impl Engine {
             .collect();
         for k in expired {
             if let Some(p) = self.clip.pending.remove(&k) {
-                let _ = p.reply.send(None);
+                self.finish_paste(p, None);
             }
         }
     }
@@ -217,7 +241,7 @@ impl Engine {
         let gone: Vec<u64> = self.clip.pending.iter().filter(|(_, p)| p.peer == peer && p.transfer.is_none()).map(|(k, _)| *k).collect();
         for k in gone {
             if let Some(p) = self.clip.pending.remove(&k) {
-                let _ = p.reply.send(None);
+                self.finish_paste(p, None);
             }
         }
     }

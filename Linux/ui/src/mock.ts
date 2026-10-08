@@ -169,6 +169,7 @@ let snap: Snapshot = {
   configs_dir: "/home/max/.config/kvmbridge/configs",
   guard: { state: "off" },
   max_devices: 5,
+  searching: false,
 };
 
 type Listener = (s: Snapshot) => void;
@@ -187,6 +188,10 @@ export async function mockInvoke(cmd: string, args: Record<string, unknown> = {}
   switch (cmd) {
     case "get_snapshot":
       return snap;
+    case "search":
+      update((s) => ({ ...s, searching: true }));
+      setTimeout(() => update((s) => ({ ...s, searching: false })), 4000);
+      return;
     case "set_layout":
       update((s) => {
         const l = args.layout as Snapshot["layout"];

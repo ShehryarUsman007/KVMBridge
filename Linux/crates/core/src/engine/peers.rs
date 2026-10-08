@@ -193,6 +193,26 @@ impl Engine {
         self.maybe_dial(b.id);
     }
 
+    /// Look for devices on the network. Earlier results that are not paired
+    /// or in use are dropped first, so the list shows who answers now.
+    pub(crate) fn search(&mut self) {
+        const SEARCH_TIME: Duration = Duration::from_secs(4);
+        let stale: Vec<DeviceId> = self
+            .peers
+            .values()
+            .filter(|p| p.conn.is_none() && p.pairing.is_none() && p.dialing.is_none() && !p.want_pair)
+            .map(|p| p.id)
+            .filter(|id| !self.is_trusted(*id))
+            .collect();
+        for id in stale {
+            self.peers.remove(&id);
+        }
+        tracing::info!("searching for devices on the network");
+        let _ = self.searches.send(());
+        self.searching_until = Some(Instant::now() + SEARCH_TIME);
+        self.mark_dirty();
+    }
+
     fn maybe_dial(&mut self, id: DeviceId) {
         let trusted = self.is_trusted(id);
         let Some(p) = self.peers.get_mut(&id) else { return };

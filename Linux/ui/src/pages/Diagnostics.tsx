@@ -57,7 +57,13 @@ export function DiagnosticsPage() {
               </div>
               <div className="muted small">{b.what}</div>
               <div className="backend-detail">
-                {st.state === "idle" ? "Not started" : st.state === "ready" ? `Working (${st.detail})` : st.detail}
+                {st.state === "idle"
+                  ? b.key === "capture"
+                    ? "Not needed yet: starts when a screen edge here leads to another computer"
+                    : "Not started"
+                  : st.state === "ready"
+                    ? `Working (${st.detail})`
+                    : st.detail}
               </div>
               {b.key === "dnd" && st.state === "ready" && (
                 <button

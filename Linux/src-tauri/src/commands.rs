@@ -155,6 +155,11 @@ pub async fn identify(state: State<'_, AppState>) -> R {
 }
 
 #[tauri::command]
+pub async fn search(state: State<'_, AppState>) -> R {
+    state.engine.request(Command::Search).await
+}
+
+#[tauri::command]
 pub async fn send_files(state: State<'_, AppState>, device: String, paths: Vec<String>) -> R {
     let paths = paths.into_iter().map(PathBuf::from).collect();
     state.engine.request(Command::SendFiles { to: id(&device)?, paths }).await

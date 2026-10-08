@@ -34,6 +34,8 @@ pub struct Snapshot {
     pub guard: GuardStatus,
     /// Most computers (including this one) that can be paired together.
     pub max_devices: usize,
+    /// A search for devices on the network is running.
+    pub searching: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]

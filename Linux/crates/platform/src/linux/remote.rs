@@ -15,10 +15,11 @@ use futures::StreamExt;
 use kvmbridge_core::platform::{
     BackendSide, BackendStatus, ClipboardCommand, ClipboardEvent, EmulationCommand, EmulationEvent,
 };
-use kvmbridge_core::types::{ClipFormat, Point};
+use kvmbridge_core::layout::Desktop;
+use kvmbridge_core::types::{keys, ClipFormat, Point, Rect};
 use reis::ei;
 use reis::event::{Device, DeviceCapability, EiEvent};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -159,6 +160,18 @@ struct Remote {
 struct ClipboardCtx {
     cb: Clipboard,
     session: Arc<Session<RemoteDesktop>>,
+    /// Held for every SelectionRead and SelectionWrite. xdg-desktop-portal-gnome
+    /// 46 aborts on overlapping reads, which ends every portal session of
+    /// this app (and input capture then needs a new permission dialog).
+    io: tokio::sync::Mutex<ReadCache>,
+}
+
+/// The last clipboard contents read, per mime type. Applications ask for the
+/// same data several times when pasting; only the first request reads it.
+#[derive(Default)]
+struct ReadCache {
+    owner: u64,
+    data: HashMap<String, Vec<u8>>,
 }
 
 impl Remote {
@@ -200,7 +213,7 @@ impl Remote {
         tracing::info!("remote desktop session started: devices {:?}, clipboard {clipboard_ok}", started.devices());
         let session = Arc::new(session);
         let clipboard = match (clipboard, clipboard_ok) {
-            (Some(cb), true) => Some(Arc::new(ClipboardCtx { cb, session: session.clone() })),
+            (Some(cb), true) => Some(Arc::new(ClipboardCtx { cb, session: session.clone(), io: Default::default() })),
             _ => None,
         };
         let fd = rd.connect_to_eis(&session, ConnectToEISOptions::default()).await?;
@@ -256,6 +269,7 @@ impl Remote {
             }
         }
         let mut ready_sent = false;
+        let mut geometry: Option<Desktop> = None;
 
         loop {
             tokio::select! {
@@ -267,7 +281,12 @@ impl Remote {
                 },
                 ev = self.events.next() => match ev {
                     Some(Ok(ev)) => {
-                        if self.on_ei(ev) && !ready_sent {
+                        let usable = self.on_ei(ev);
+                        if let Some(d) = self.screens().filter(|d| geometry.as_ref() != Some(d)) {
+                            geometry = Some(d.clone());
+                            let _ = emu.events.send(EmulationEvent::Geometry(d));
+                        }
+                        if usable && !ready_sent {
                             ready_sent = true;
                             let kind = if self.dev.abs.is_some() { "RemoteDesktop portal (absolute)" } else { "RemoteDesktop portal (relative)" };
                             let _ = emu.events.send(EmulationEvent::Status(BackendStatus::Ready(kind.into())));
@@ -292,6 +311,7 @@ impl Remote {
                         }
                     }
                     clip_state.local_mimes = mimes;
+                    clip_state.owner += 1;
                     if !formats.is_empty() {
                         let _ = clip.events.send(ClipboardEvent::LocalChanged { formats });
                     }
@@ -301,6 +321,17 @@ impl Remote {
                 }
             }
         }
+    }
+
+    /// The screens as the absolute pointer sees them (logical pixels).
+    fn screens(&self) -> Option<Desktop> {
+        let regions = self.dev.abs.as_ref()?.regions();
+        if regions.is_empty() {
+            return None;
+        }
+        Some(Desktop::new(
+            regions.iter().map(|r| Rect::new(r.x as f64, r.y as f64, r.width as f64, r.height as f64)).collect(),
+        ))
     }
 
     /// Returns true once a usable device exists.
@@ -493,6 +524,12 @@ impl Remote {
                 }
             }
             EmulationCommand::Leave { park } => {
+                // A button still held may be dragging files: Escape cancels
+                // the drag, where letting go would drop them at the edge.
+                if !self.buttons.is_empty() {
+                    self.emulate(EmulationCommand::Key { code: keys::KEY_ESC, pressed: true });
+                    self.emulate(EmulationCommand::Key { code: keys::KEY_ESC, pressed: false });
+                }
                 self.release_all();
                 if let Some(p) = park {
                     self.move_to(p);
@@ -539,6 +576,8 @@ async fn next_opt<S: futures::Stream + Unpin>(s: &mut Option<S>) -> Option<S::It
 struct ClipState {
     /// Mime types offered by the local owner of the clipboard.
     local_mimes: Vec<String>,
+    /// Counts clipboard owner changes (keys the read cache).
+    owner: u64,
     /// Offer currently advertised on behalf of a remote device.
     remote_offer: Option<u64>,
 }
@@ -572,8 +611,25 @@ impl ClipState {
                     let _ = reply.send(None);
                     return;
                 };
+                let owner = self.owner;
                 tokio::spawn(async move {
-                    let data = read_selection(&ctx, &mime).await;
+                    let data = {
+                        let mut io = ctx.io.lock().await;
+                        if owner > io.owner {
+                            io.owner = owner;
+                            io.data.clear();
+                        }
+                        match io.data.get(&mime) {
+                            Some(d) => Some(d.clone()),
+                            None => {
+                                let d = read_selection(&ctx, &mime).await;
+                                if let Some(d) = d.as_ref().filter(|_| owner == io.owner) {
+                                    io.data.insert(mime.clone(), d.clone());
+                                }
+                                d
+                            }
+                        }
+                    };
                     let data = data.map(|d| if format == ClipFormat::Files { normalize_file_list(&mime, &d) } else { d });
                     let _ = reply.send(data);
                 });
@@ -595,6 +651,7 @@ impl ClipState {
         tokio::spawn(async move {
             let wait = if format == ClipFormat::Files { Duration::from_secs(3600) } else { Duration::from_secs(30) };
             let data = tokio::time::timeout(wait, rx).await.ok().and_then(|r| r.ok()).flatten();
+            let _io = ctx.io.lock().await;
             let ok = match data {
                 Some(d) => {
                     let d = if format == ClipFormat::Files { encode_file_list(&mime, &d) } else { d };

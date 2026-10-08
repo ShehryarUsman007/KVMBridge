@@ -36,7 +36,7 @@ needs.
 
 Install KVM Bridge on every computer that should take part.
 
-The computers talk over UDP port 47800 (discovery) and TCP port 47801
+The computers talk over UDP port 47800 (finding each other) and TCP port 47801
 (connections). If a computer does not show up, a firewall is the usual cause.
 The packages include firewall rules for KVM Bridge; allow them on the local
 network (replace `192.168.1.0/24` with your network):
@@ -51,11 +51,13 @@ you switched it on.
 
 ## First start
 
-GNOME asks for two permissions the first time:
+GNOME asks for up to two permissions:
 
 1. **Input capture**: lets this computer's keyboard and mouse move to other
-   screens. GNOME asks again on every start, and when a screen is moved to a
-   side of this one that had no screen before.
+   screens. Only the computer whose keyboard and mouse are used asks for it,
+   once a screen is placed next to it. GNOME 46 cannot remember this
+   permission, so it is asked again each time KVM Bridge starts, and when a
+   screen is moved to a side of this one that had no screen before.
 2. **Remote desktop**: lets other computers move the cursor and type here.
    KVM Bridge remembers this one.
 
@@ -73,9 +75,11 @@ bottom-right corner when the cursor moves on.
 
 ## Using it
 
-1. **Pair.** On **Devices**, nearby computers appear with their names. Click
-   **Pair** on one, check that both computers show the same 6-digit code, and
-   confirm on both. If a computer does not show up, add it by IP address.
+1. **Pair.** On **Devices**, click **Search** to find the computers on your
+   network running KVM Bridge. Click **Pair** on one, check that both
+   computers show the same 6-digit code, and confirm on both. If a computer
+   does not show up, add it by IP address. KVM Bridge only searches when you
+   click **Search**; paired computers find each other again on their own.
 2. **Arrange.** On **Screens**, drag the screens to match your desk. A
    computer with several monitors is one screen: its own system moves the
    cursor between its monitors.
@@ -130,9 +134,11 @@ in [docs/config-file-format.md](docs/config-file-format.md).
   images and files. Large items are transferred when they are pasted.
 * **Transfers** sends files or folders to another computer, by drag and drop
   into the window or with the file picker.
-* Dragging files across a screen edge drops them on the other computer, on
-  the desktop, in a folder or into an application. This is new and
-  experimental. **Status → Drag and drop → Test** tries it on one computer.
+* Dragging files from the computer whose keyboard and mouse are used across a
+  screen edge drops them on the other computer, on the desktop, in a folder
+  or into an application. This is new and experimental. Dragging the other
+  way is not supported yet: a drag carried off a controlled computer is
+  cancelled. **Status → Drag and drop → Test** tries it on one computer.
 
 ## Settings
 
@@ -140,7 +146,7 @@ in [docs/config-file-format.md](docs/config-file-format.md).
   ChaCha20-Poly1305 (fast everywhere). **Automatic** picks AES when the CPU
   supports it. All paired computers use the same choice.
 * **Update interval**: presets from *Lowest latency* to *Power saver*, or
-  custom values for motion, heartbeat, discovery and clipboard checks.
+  custom values for motion, heartbeat and clipboard checks.
 * **Shortcuts**: bring the cursor back (default `Ctrl+Alt+Shift+Esc`), and
   lock the cursor to the current screen (default `Scroll Lock`).
 * **Backup**: a full backup of this computer, optionally including its

@@ -22,7 +22,8 @@ pub struct Timing {
     pub heartbeat_ms: u32,
     /// Heartbeats that may be missed before a device is considered gone.
     pub heartbeat_misses: u32,
-    /// How often this device announces itself on the local network.
+    /// No longer used: devices are only searched for on request. Kept so
+    /// settings stay readable by older versions.
     pub discovery_ms: u32,
     /// Clipboard polling interval for platforms without change notifications.
     pub clipboard_poll_ms: u32,

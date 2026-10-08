@@ -92,6 +92,10 @@ pub enum CaptureCommand {
 #[derive(Debug)]
 pub enum EmulationEvent {
     Status(BackendStatus),
+    /// Monitor layout as the emulated pointer sees it (logical coordinates).
+    /// Takes precedence over [`CaptureEvent::Geometry`], and lets a computer
+    /// that is only controlled report its screens without capturing input.
+    Geometry(Desktop),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -152,13 +156,15 @@ pub enum DndEvent {
     /// Move the pointer a little through the input emulation (so the
     /// compositor notices windows that appeared under it).
     InjectMove { dx: f64, dy: f64 },
+    /// Tap Escape through the input emulation (cancels a drag in progress).
+    InjectEscape,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProbeOutcome {
     /// The drag was dropped on another device.
     Dropped { accepted: bool },
-    /// The cursor came back; the original local drag continues.
+    /// The cursor came back.
     Returned,
     /// Nothing happened with it (control was released, etc.).
     Abandoned,

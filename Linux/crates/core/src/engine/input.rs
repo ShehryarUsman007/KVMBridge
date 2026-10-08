@@ -169,6 +169,15 @@ impl Engine {
         }
     }
 
+    pub(crate) fn set_local_desktop(&mut self, d: Desktop) {
+        if self.desktop.as_ref() != Some(&d) {
+            tracing::info!("local desktop: {:?}", d.monitors);
+            self.desktop = Some(d.clone());
+            self.broadcast(Msg::Geometry(Some(d)));
+            self.mark_dirty();
+        }
+    }
+
     pub(crate) fn on_capture(&mut self, ev: CaptureEvent) {
         match ev {
             CaptureEvent::Status(s) => {
@@ -186,11 +195,8 @@ impl Engine {
                 self.mark_dirty();
             }
             CaptureEvent::Geometry(d) => {
-                if self.desktop.as_ref() != Some(&d) {
-                    tracing::info!("local desktop: {:?}", d.monitors);
-                    self.desktop = Some(d.clone());
-                    self.broadcast(Msg::Geometry(Some(d)));
-                    self.mark_dirty();
+                if !self.desktop_from_emulation {
+                    self.set_local_desktop(d);
                 }
             }
             CaptureEvent::Guard(g) => self.on_guard(g),

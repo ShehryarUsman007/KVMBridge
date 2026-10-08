@@ -181,6 +181,7 @@ fn main() {
             commands::unpair,
             commands::connect_address,
             commands::identify,
+            commands::search,
             commands::send_files,
             commands::cancel_transfer,
             commands::release_control,

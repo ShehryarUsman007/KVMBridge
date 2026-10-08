@@ -192,6 +192,8 @@ export interface Snapshot {
   configs_dir: string;
   guard: GuardStatus;
   max_devices: number;
+  /** A search for devices on the network is running. */
+  searching: boolean;
 }
 
 export type Notice =
@@ -274,6 +276,7 @@ export const api = {
   unpair: (device: DeviceId) => invoke<void>("unpair", { device }),
   connectAddress: (address: string) => invoke<void>("connect_address", { address }),
   identify: () => invoke<void>("identify"),
+  search: () => invoke<void>("search"),
   sendFiles: (device: DeviceId, paths: string[]) => invoke<void>("send_files", { device, paths }),
   cancelTransfer: (id: number) => invoke<void>("cancel_transfer", { id }),
   releaseControl: () => invoke<void>("release_control"),

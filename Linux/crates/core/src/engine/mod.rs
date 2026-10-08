@@ -49,6 +49,8 @@ pub enum Command {
     ConnectAddress(String),
     /// Show screen numbers on every connected device.
     Identify,
+    /// Look for devices on the local network (nothing is searched otherwise).
+    Search,
     SendFiles { to: DeviceId, paths: Vec<PathBuf> },
     CancelTransfer(u64),
     /// Bring the cursor back to this device.
@@ -164,6 +166,8 @@ pub(crate) struct Engine {
     peers: HashMap<DeviceId, Peer>,
     conns: HashMap<u64, ConnState>,
     desktop: Option<Desktop>,
+    /// `desktop` came from the emulation backend (capture's is then ignored).
+    desktop_from_emulation: bool,
     input: Input,
     controlled: Option<Controlled>,
     locked: bool,
@@ -192,6 +196,9 @@ pub(crate) struct Engine {
     save_at: Option<Instant>,
     disc_cfg: watch::Sender<DiscoveryConfig>,
     beacon: watch::Sender<Beacon>,
+    searches: mpsc::UnboundedSender<()>,
+    /// A search for devices is running until then.
+    searching_until: Option<Instant>,
     shutting_down: bool,
 }
 
@@ -233,7 +240,8 @@ pub async fn start(paths: Paths, platform: Platform, overrides: Overrides) -> an
     let (disc_tx, disc_rx) = watch::channel(disc);
     let (beacon_tx, beacon_rx) = watch::channel(beacon);
     let (seen_tx, seen_rx) = mpsc::channel(256);
-    tokio::spawn(discovery::run(disc_rx, beacon_rx, seen_tx));
+    let (search_tx, search_rx) = mpsc::unbounded_channel();
+    tokio::spawn(discovery::run(disc_rx, beacon_rx, search_rx, seen_tx));
 
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (internal_tx, internal_rx) = mpsc::unbounded_channel();
@@ -261,6 +269,7 @@ pub async fn start(paths: Paths, platform: Platform, overrides: Overrides) -> an
         peers: HashMap::new(),
         conns: HashMap::new(),
         desktop: None,
+        desktop_from_emulation: false,
         input: Input::Local,
         controlled: None,
         locked: false,
@@ -284,6 +293,8 @@ pub async fn start(paths: Paths, platform: Platform, overrides: Overrides) -> an
         save_at: None,
         disc_cfg: disc_tx,
         beacon: beacon_tx,
+        searches: search_tx,
+        searching_until: None,
         shutting_down: false,
     };
     let snap = engine.build_snapshot();
@@ -318,7 +329,6 @@ fn discovery_config(s: &Settings, o: &Overrides) -> DiscoveryConfig {
     }
     DiscoveryConfig {
         port,
-        interval: Duration::from_millis(s.timing.discovery_ms as u64),
         enabled: s.discovery_enabled,
         broadcast: o.discovery_broadcast.unwrap_or(true),
         extra_targets: extra,
@@ -386,6 +396,7 @@ fn dummy_snapshot() -> Snapshot {
         configs_dir: String::new(),
         guard: GuardStatus::Off,
         max_devices: config::MAX_DEVICES,
+        searching: false,
     }
 }
 
@@ -483,6 +494,10 @@ impl Engine {
     fn on_tick(&mut self) {
         let now = Instant::now();
         self.tick_connections(now);
+        if self.searching_until.is_some_and(|t| now >= t) {
+            self.searching_until = None;
+            self.mark_dirty();
+        }
         self.tick_transfers();
         self.tick_clipboard(now);
         if let Some(t) = self.save_at {
@@ -499,6 +514,10 @@ impl Engine {
                 self.backends.emulation = s;
                 self.broadcast_caps();
                 self.mark_dirty();
+            }
+            EmulationEvent::Geometry(d) => {
+                self.desktop_from_emulation = true;
+                self.set_local_desktop(d);
             }
         }
     }
@@ -548,6 +567,10 @@ impl Engine {
             Command::ConnectAddress(a) => self.connect_address(&a),
             Command::Identify => {
                 self.identify();
+                Ok(())
+            }
+            Command::Search => {
+                self.search();
                 Ok(())
             }
             Command::SendFiles { to, paths } => self.send_files(to, paths),
@@ -674,6 +697,7 @@ impl Engine {
             configs_dir: self.library.dir().display().to_string(),
             guard: self.guard.clone(),
             max_devices: config::MAX_DEVICES,
+            searching: self.searching_until.is_some(),
         }
     }
 }

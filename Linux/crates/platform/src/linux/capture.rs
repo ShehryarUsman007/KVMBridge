@@ -2,8 +2,9 @@
 //! portal (GNOME 45+, KDE Plasma 6.1+). Captured events arrive over libei.
 //!
 //! GNOME 46 quirks handled here:
-//! * creating a session shows a permission dialog every time, so the session
-//!   is kept alive as long as possible;
+//! * creating a session shows a permission dialog every time, so a session
+//!   is only created once an edge leads to another screen, and is then kept
+//!   alive as long as possible;
 //! * a session may connect to libei only once, and `Disable` (needed to
 //!   change barriers) removes its libei seat for good. Barriers are therefore
 //!   set once per session. Edges that no longer lead anywhere keep their
@@ -42,6 +43,20 @@ fn status(side: &Side, s: BackendStatus) {
 pub async fn run(mut side: Side, guard: Guard) {
     let mut edges: Vec<Edge> = Vec::new();
     loop {
+        // No session (and no permission dialog) until an edge of this
+        // computer leads to another screen: a computer that is only ever
+        // controlled never needs one.
+        if edges.is_empty() {
+            status(&side, BackendStatus::Idle);
+            while edges.is_empty() {
+                match side.commands.recv().await {
+                    None => return,
+                    Some(CaptureCommand::SetEdges(e)) => edges = e,
+                    Some(CaptureCommand::BlockLocalInput(b)) => guard.set(b),
+                    Some(_) => {}
+                }
+            }
+        }
         status(&side, BackendStatus::Starting("Waiting for permission to capture input…".into()));
         match Capture::create(guard.clone()).await {
             Ok(mut cap) => {

@@ -1,8 +1,10 @@
 //! Finding other KVM Bridge devices on the local subnet.
 //!
-//! Every device periodically broadcasts a small beacon (UDP) to the broadcast
-//! address of each IPv4 interface. Beacons only advertise; all trust decisions
-//! happen later in the authenticated handshake.
+//! Devices find each other with small UDP beacons sent to the broadcast
+//! address of each IPv4 interface: one announcement when a device starts, and
+//! probes when the user searches (answered directly by every device that hears
+//! them). Nothing is sent in between. Beacons only advertise; all trust
+//! decisions happen later in the authenticated handshake.
 
 use crate::types::DeviceId;
 use serde::{Deserialize, Serialize};
@@ -12,6 +14,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, watch};
+use tokio::time::Instant;
 
 const BEACON_MAGIC: &[u8; 6] = b"KVMB-D";
 
@@ -48,7 +51,7 @@ impl Beacon {
 #[derive(Clone, Debug)]
 pub struct DiscoveryConfig {
     pub port: u16,
-    pub interval: Duration,
+    /// Announce this device and answer searches.
     pub enabled: bool,
     /// Send to interface broadcast addresses (disable in tests).
     pub broadcast: bool,
@@ -108,11 +111,21 @@ fn bind_socket(port: u16) -> std::io::Result<std::net::UdpSocket> {
     Ok(s.into())
 }
 
-/// Run discovery until the config channel closes. Every beacon received from
-/// another device is forwarded on `out`.
+/// When a search sends its probes, relative to the click. Spread out so a
+/// device that misses one (Wi-Fi drops broadcasts) still answers another.
+const SEARCH_PROBES_MS: [u64; 4] = [0, 400, 1200, 2500];
+
+/// Run discovery until a channel closes. Every beacon received from another
+/// device is forwarded on `out`.
+///
+/// Nothing is sent periodically. This device announces itself once when it
+/// starts (so paired devices learn a changed address) and when its name or
+/// port changes; each message on `searches` sends a few probes, which other
+/// devices answer directly.
 pub async fn run(
     mut cfg: watch::Receiver<DiscoveryConfig>,
     mut beacon: watch::Receiver<Beacon>,
+    mut searches: mpsc::UnboundedReceiver<()>,
     out: mpsc::Sender<Seen>,
 ) {
     let me = beacon.borrow().id;
@@ -129,25 +142,30 @@ pub async fn run(
             }
         };
         tracing::info!("discovery listening on UDP {port}");
-        // Probe burst at start so devices show up immediately.
-        let mut burst = 3u32;
         let mut buf = vec![0u8; 2048];
-        let mut next_send = tokio::time::Instant::now();
+        // Beacons still to send: when, and whether it is a search probe.
+        let mut queue: Vec<(Instant, bool)> = vec![(Instant::now(), false)];
         loop {
-            let (enabled, interval) = {
-                let c = cfg.borrow();
-                (c.enabled, c.interval)
-            };
+            let enabled = cfg.borrow().enabled;
+            let next = queue.iter().map(|(t, _)| *t).min();
             tokio::select! {
-                _ = tokio::time::sleep_until(next_send) => {
-                    if enabled {
+                _ = tokio::time::sleep_until(next.unwrap_or_else(Instant::now)), if next.is_some() => {
+                    let now = Instant::now();
+                    let probe = queue.iter().any(|(t, p)| *t <= now && *p);
+                    queue.retain(|(t, _)| *t > now);
+                    // Announcing can be turned off; searching was asked for.
+                    if enabled || probe {
                         let mut b = beacon.borrow().clone();
-                        b.probe = burst > 0;
+                        b.probe = probe;
                         let c = cfg.borrow().clone();
                         send_beacon(&sock, &b, &c).await;
                     }
-                    let wait = if burst > 0 { burst -= 1; Duration::from_millis(300) } else { interval };
-                    next_send = tokio::time::Instant::now() + wait;
+                }
+                s = searches.recv() => {
+                    if s.is_none() { return; }
+                    let now = Instant::now();
+                    queue.retain(|(_, p)| !*p);
+                    queue.extend(SEARCH_PROBES_MS.iter().map(|ms| (now + Duration::from_millis(*ms), true)));
                 }
                 r = sock.recv_from(&mut buf) => {
                     let Ok((n, from)) = r else { continue };
@@ -165,13 +183,11 @@ pub async fn run(
                 r = cfg.changed() => {
                     if r.is_err() { return; }
                     if cfg.borrow().port != port { break; }
-                    burst = 1;
-                    next_send = tokio::time::Instant::now();
                 }
                 r = beacon.changed() => {
                     if r.is_err() { return; }
                     // Name/port change: announce right away.
-                    next_send = tokio::time::Instant::now();
+                    queue.push((Instant::now(), false));
                 }
             }
         }

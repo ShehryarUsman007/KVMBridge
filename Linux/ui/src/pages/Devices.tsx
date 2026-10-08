@@ -1,7 +1,7 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { api, PeerView } from "../api";
 import { cipherLabel, useEngine } from "../store";
-import { IconCheck, IconLaptop, IconLinux, IconMonitor, IconPlus, IconTrash, IconUpload, IconWifi, IconWindows } from "../components/Icons";
+import { IconCheck, IconLaptop, IconLinux, IconMonitor, IconPlus, IconRefresh, IconTrash, IconUpload, IconWifi, IconWindows } from "../components/Icons";
 import { open } from "@tauri-apps/plugin-dialog";
 
 function OsIcon({ os }: { os: string }) {
@@ -35,14 +35,8 @@ function localSubnet(addresses: string[]): string | null {
   return null;
 }
 
-/** Shown when nothing has been found for a while: the usual cause is a firewall. */
+/** Shown when a search found nothing: the usual cause is a firewall. */
 function FirewallHint({ addresses }: { addresses: string[] }) {
-  const [show, setShow] = useState(false);
-  useEffect(() => {
-    const t = window.setTimeout(() => setShow(true), 8000);
-    return () => window.clearTimeout(t);
-  }, []);
-  if (!show) return null;
   const subnet = localSubnet(addresses);
   const ufw = subnet ? `sudo ufw allow from ${subnet} to any app "KVM Bridge"` : `sudo ufw allow "KVM Bridge"`;
   return (
@@ -70,12 +64,15 @@ export function DevicesPage() {
   const { snap, run } = useEngine();
   const [address, setAddress] = useState("");
   const [name, setName] = useState<string | null>(null);
+  const [searched, setSearched] = useState(false);
   if (!snap) return null;
 
   const paired = snap.peers.filter((p) => p.trusted);
   const nearby = snap.peers.filter((p) => !p.trusted);
   const full = paired.length + 1 >= snap.max_devices;
   const slotNumber = (id: string) => snap.layout.slots.find((s) => s.device === id)?.number;
+  // Only the controlling computer (or any, when none is chosen) captures input.
+  const sendsInput = (id: string) => snap.layout.controller == null || snap.layout.controller === id;
 
   const saveName = () => {
     if (name === null) return;
@@ -91,7 +88,7 @@ export function DevicesPage() {
       <div className="page-header">
         <div>
           <h1>Devices</h1>
-          <p className="muted">Computers running KVM Bridge on this network appear here automatically. Pair them once to share input.</p>
+          <p className="muted">Search to find computers running KVM Bridge on this network, then pair them once to share input.</p>
         </div>
       </div>
 
@@ -155,10 +152,10 @@ export function DevicesPage() {
                     {p.fingerprint}
                   </span>
                 </div>
-                {p.status === "connected" && (!p.caps.emulation || !p.caps.capture) && (
+                {p.status === "connected" && (!p.caps.emulation || (!p.caps.capture && sendsInput(p.id))) && (
                   <div className="meta warn-text">
                     {!p.caps.emulation && "This device can't be controlled yet (it has not granted input permission). "}
-                    {!p.caps.capture && "This device can't send its input yet."}
+                    {!p.caps.capture && sendsInput(p.id) && "This device can't send its input yet."}
                   </div>
                 )}
                 {p.error && <div className="meta error-text">{p.error}</div>}
@@ -191,9 +188,21 @@ export function DevicesPage() {
         </div>
       )}
 
-      <h2>
-        Nearby devices <span className="muted small">(discovered on your network)</span>
-      </h2>
+      <div className="section-title">
+        <h2>
+          Nearby devices <span className="muted small">(found on your network)</span>
+        </h2>
+        <button
+          className="btn"
+          disabled={snap.searching}
+          onClick={() => {
+            setSearched(true);
+            run(api.search());
+          }}
+        >
+          <IconRefresh /> {snap.searching ? "Searching…" : "Search"}
+        </button>
+      </div>
       {full && nearby.length > 0 && (
         <div className="notice warn small" style={{ marginBottom: 10 }}>
           You've reached the limit of {snap.max_devices} computers. Unpair one to pair another.
@@ -202,9 +211,14 @@ export function DevicesPage() {
       {nearby.length === 0 ? (
         <>
           <div className="empty-state">
-            <IconWifi /> Looking for other computers running KVM Bridge… Make sure it's running on them and that they're on the same network.
+            <IconWifi />{" "}
+            {snap.searching
+              ? "Searching for other computers running KVM Bridge…"
+              : searched
+                ? "No other computers answered. Make sure KVM Bridge is running on them and that they're on the same network."
+                : "Click Search to look for other computers running KVM Bridge on this network."}
           </div>
-          {paired.length === 0 && <FirewallHint addresses={snap.me.addresses} />}
+          {searched && !snap.searching && paired.length === 0 && <FirewallHint addresses={snap.me.addresses} />}
         </>
       ) : (
         <div className="device-list">

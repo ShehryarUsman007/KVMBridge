@@ -274,16 +274,6 @@ export function SettingsPage() {
           onChange={(v) => set((d) => ({ ...d, timing: { ...d.timing, heartbeat_misses: v } }))}
         />
         <Slider
-          label="Network discovery interval"
-          value={s.timing.discovery_ms}
-          min={250}
-          max={30000}
-          step={250}
-          format={(v) => (v < 1000 ? `${v} ms` : `${(v / 1000).toFixed(1)} s`)}
-          hint="How often this computer announces itself on the local network."
-          onChange={(v) => set((d) => ({ ...d, timing: { ...d.timing, discovery_ms: v } }))}
-        />
-        <Slider
           label="Clipboard check interval"
           value={s.timing.clipboard_poll_ms}
           min={100}
@@ -366,8 +356,8 @@ export function SettingsPage() {
       <section className="card settings-section">
         <h2>Network</h2>
         <Toggle
-          label="Announce this computer on the local network"
-          hint="Lets other computers find this one automatically."
+          label="Let other computers find this one"
+          hint="Answers searches from other computers and announces this one once when KVM Bridge starts. Nothing is sent otherwise."
           checked={s.discovery_enabled}
           onChange={(v) => set((d) => ({ ...d, discovery_enabled: v }))}
         />
