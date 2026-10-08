@@ -272,7 +272,7 @@ impl Engine {
             // nearest screen that is still on when it learns we are off.
             self.release_control_local();
             if self.controlled.take().is_some() {
-                let _ = self.emu.send(EmulationCommand::Leave);
+                let _ = self.emu.send(EmulationCommand::Leave { park: None });
                 self.dnd_controller_changed();
             }
             self.clip = ClipState::default();

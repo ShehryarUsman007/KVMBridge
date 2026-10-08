@@ -104,8 +104,9 @@ pub enum EmulationCommand {
     Key { code: u32, pressed: bool },
     Scroll { dx: f64, dy: f64 },
     ScrollDiscrete { dx: i32, dy: i32 },
-    /// The remote cursor left: release anything still held down.
-    Leave,
+    /// The remote cursor left: release anything still held down, then move
+    /// the pointer to `park` (out of sight) if given.
+    Leave { park: Option<Point> },
     /// Tear down and set up again (e.g. after the user denied a permission).
     Restart,
 }
@@ -165,13 +166,15 @@ pub enum ProbeOutcome {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum DndCommand {
-    /// The cursor just left this screen at `pos`: check whether a file drag is
-    /// in progress and report it with [`DndEvent::Probed`].
+    /// A mouse button held while the cursor left this screen at `pos` was let
+    /// go on another screen: check whether a file drag is in progress here and
+    /// report it with [`DndEvent::Probed`].
     Probe { probe: u64, pos: Point },
     ProbeDone { probe: u64, outcome: ProbeOutcome },
     /// Start a native drag of not-yet-received files under the (remote
-    /// controlled) cursor at `pos`.
-    StartDrag { drag: u64, names: Vec<String>, pos: Point },
+    /// controlled) cursor at `pos`, and drop it wherever the cursor is
+    /// `drop_after_ms` later.
+    StartDrag { drag: u64, names: Vec<String>, pos: Point, drop_after_ms: u64 },
     CancelDrag { drag: u64 },
 }
 

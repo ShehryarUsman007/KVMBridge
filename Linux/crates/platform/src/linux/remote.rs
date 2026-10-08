@@ -32,12 +32,19 @@ type ClipSide = BackendSide<ClipboardCommand, ClipboardEvent>;
 
 const MAX_CLIPBOARD: usize = 256 * 1024 * 1024;
 
+/// A session that lasted at least this long counts as a good one when it ends.
+const STABLE_SESSION: Duration = Duration::from_secs(60);
+/// Reconnect attempts after sessions that ended soon after starting.
+const MAX_QUICK_RECONNECTS: u32 = 3;
+
 pub async fn run(mut emu: EmuSide, mut clip: ClipSide, token_file: PathBuf) {
+    let mut quick_ends = 0u32;
     loop {
         let _ = emu.events.send(EmulationEvent::Status(BackendStatus::Starting(
             "Waiting for permission to control this computer…".into(),
         )));
         let _ = clip.events.send(ClipboardEvent::Status(BackendStatus::Starting("Waiting for remote desktop session…".into())));
+        let started = std::time::Instant::now();
         let exit = match Remote::create(&token_file).await {
             Ok(mut r) => {
                 let e = r.serve(&mut emu, &mut clip).await;
@@ -46,21 +53,47 @@ pub async fn run(mut emu: EmuSide, mut clip: ClipSide, token_file: PathBuf) {
             }
             Err(e) => Exit::Failed(describe(&e)),
         };
-        match exit {
+        let retry_in = match exit {
             Exit::ChannelClosed => return,
-            Exit::Restart => continue,
+            Exit::Restart => {
+                quick_ends = 0;
+                continue;
+            }
+            Exit::Closed(msg) => {
+                // The desktop ended a working session. The saved permission
+                // lets us start a new one without asking.
+                quick_ends = if started.elapsed() >= STABLE_SESSION { 1 } else { quick_ends + 1 };
+                let has_token = std::fs::read_to_string(&token_file).is_ok_and(|t| !t.trim().is_empty());
+                if has_token && quick_ends <= MAX_QUICK_RECONNECTS {
+                    tracing::warn!("remote desktop backend: {msg}; reconnecting");
+                    Some(Duration::from_secs(2u64.pow(quick_ends)))
+                } else {
+                    tracing::warn!("remote desktop backend: {msg}");
+                    let msg = format!("{msg}. Click Retry to reconnect.");
+                    let _ = emu.events.send(EmulationEvent::Status(BackendStatus::Unavailable(msg.clone())));
+                    let _ = clip.events.send(ClipboardEvent::Status(BackendStatus::Unavailable(msg)));
+                    None
+                }
+            }
             Exit::Failed(msg) => {
                 tracing::warn!("remote desktop backend: {msg}");
                 let _ = emu.events.send(EmulationEvent::Status(BackendStatus::Unavailable(msg.clone())));
                 let _ = clip.events.send(ClipboardEvent::Status(BackendStatus::Unavailable(msg)));
+                None
             }
-        }
-        // Wait for an explicit retry; answer clipboard reads with nothing.
+        };
+        // Wait for the reconnect delay or an explicit retry; answer
+        // clipboard reads with nothing meanwhile.
+        let deadline = retry_in.map(|d| tokio::time::Instant::now() + d);
         loop {
             tokio::select! {
+                _ = tokio::time::sleep_until(deadline.unwrap_or_else(tokio::time::Instant::now)), if deadline.is_some() => break,
                 c = emu.commands.recv() => match c {
                     None => return,
-                    Some(EmulationCommand::Restart) => break,
+                    Some(EmulationCommand::Restart) => {
+                        quick_ends = 0;
+                        break;
+                    }
                     Some(_) => {}
                 },
                 c = clip.commands.recv() => match c {
@@ -87,6 +120,8 @@ fn describe(e: &anyhow::Error) -> String {
 enum Exit {
     ChannelClosed,
     Restart,
+    /// A running session ended.
+    Closed(String),
     Failed(String),
 }
 
@@ -233,8 +268,8 @@ impl Remote {
                             let _ = emu.events.send(EmulationEvent::Status(BackendStatus::Ready(kind.into())));
                         }
                     }
-                    Some(Err(e)) => return Exit::Failed(format!("libei error: {e}")),
-                    None => return Exit::Failed("the remote desktop session was closed".into()),
+                    Some(Err(e)) => return Exit::Closed(format!("libei error: {e}")),
+                    None => return Exit::Closed("the remote desktop session was closed".into()),
                 },
                 cmd = clip.commands.recv() => match cmd {
                     None => return Exit::ChannelClosed,
@@ -452,8 +487,11 @@ impl Remote {
                     }
                 }
             }
-            EmulationCommand::Leave => {
+            EmulationCommand::Leave { park } => {
                 self.release_all();
+                if let Some(p) = park {
+                    self.move_to(p);
+                }
                 self.stop_emulating_all();
                 self.active = false;
             }
@@ -541,6 +579,7 @@ impl ClipState {
     fn transfer(&mut self, mime: String, serial: u32, ctx: &Option<Arc<ClipboardCtx>>, clip: &ClipSide) {
         let Some(ctx) = ctx.clone() else { return };
         let (Some(offer), Some(format)) = (self.remote_offer, mime_to_format(&mime)) else {
+            tracing::info!("an application asked for clipboard type {mime}, which is not shared");
             tokio::spawn(async move {
                 let _ = ctx.cb.selection_write_done(&ctx.session, serial, false).await;
             });
@@ -554,7 +593,13 @@ impl ClipState {
             let ok = match data {
                 Some(d) => {
                     let d = if format == ClipFormat::Files { encode_file_list(&mime, &d) } else { d };
-                    write_selection(&ctx, serial, &d).await.is_ok()
+                    match write_selection(&ctx, serial, &d).await {
+                        Ok(()) => true,
+                        Err(e) => {
+                            tracing::warn!("cannot hand the pasted data to the application: {e:#}");
+                            false
+                        }
+                    }
                 }
                 None => false,
             };
@@ -564,7 +609,13 @@ impl ClipState {
 }
 
 async fn read_selection(ctx: &ClipboardCtx, mime: &str) -> Option<Vec<u8>> {
-    let fd = ctx.cb.selection_read(&ctx.session, mime).await.ok()?;
+    let fd = match ctx.cb.selection_read(&ctx.session, mime).await {
+        Ok(fd) => fd,
+        Err(e) => {
+            tracing::warn!("cannot read the clipboard ({mime}): {e}");
+            return None;
+        }
+    };
     let fd: OwnedFd = fd.into();
     let file = tokio::fs::File::from_std(std::fs::File::from(fd));
     let mut out = Vec::new();

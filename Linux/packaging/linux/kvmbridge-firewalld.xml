@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<service>
+  <short>KVM Bridge</short>
+  <description>Shares one keyboard and mouse, the clipboard and files between computers on the local network.</description>
+  <port protocol="udp" port="47800"/>
+  <port protocol="tcp" port="47801"/>
+</service>

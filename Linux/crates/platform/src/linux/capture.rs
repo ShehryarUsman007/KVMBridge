@@ -1,16 +1,18 @@
 //! Input capture on Wayland through the `org.freedesktop.portal.InputCapture`
 //! portal (GNOME 45+, KDE Plasma 6.1+). Captured events arrive over libei.
 //!
-//! GNOME quirks handled here:
+//! GNOME 46 quirks handled here:
 //! * creating a session shows a permission dialog every time, so the session
-//!   is kept alive for the lifetime of the app;
-//! * barriers can only be changed while the session is disabled, and after a
-//!   `Disable` the existing libei connection stops receiving events. We
-//!   therefore drop the libei connection, change barriers, re-enable and
-//!   connect a fresh libei client.
+//!   is kept alive as long as possible;
+//! * a session may connect to libei only once, and `Disable` (needed to
+//!   change barriers) removes its libei seat for good. Barriers are therefore
+//!   set once per session. Edges that no longer lead anywhere keep their
+//!   barrier but are released at once when hit; an edge that needs a new
+//!   barrier (a screen moved to another side, monitors changed) starts a new
+//!   session after the arrangement has settled.
 
 use ashpd::desktop::input_capture::{
-    ActivatedBarrier, Barrier, Capabilities, ConnectToEISOptions, CreateSessionOptions, DisableOptions,
+    ActivatedBarrier, Barrier, Capabilities, ConnectToEISOptions, CreateSessionOptions,
     EnableOptions, GetZonesOptions, InputCapture, ReleaseOptions, SetPointerBarriersOptions,
 };
 use ashpd::desktop::Session;
@@ -25,6 +27,11 @@ use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
+use tokio::time::Instant;
+
+/// How long the screen arrangement must stay unchanged before a new session
+/// (and with it a permission dialog) is started for it.
+const RESTART_DELAY: Duration = Duration::from_millis(1500);
 
 type Side = BackendSide<CaptureCommand, CaptureEvent>;
 
@@ -96,6 +103,10 @@ struct Capture {
     enabled: bool,
     ei: Option<EiConn>,
     activation: Option<u32>,
+    /// Edges that currently lead to another screen (a subset of the barriers).
+    live: Vec<Edge>,
+    /// A new session is needed for the wanted edges; started at this time.
+    restart_at: Option<Instant>,
     /// Pauses this computer's own keyboards and mice.
     guard: Guard,
 }
@@ -124,6 +135,8 @@ impl Capture {
             enabled: false,
             ei: None,
             activation: None,
+            live: vec![],
+            restart_at: None,
             guard,
         };
         c.refresh_zones().await?;
@@ -145,17 +158,23 @@ impl Capture {
         Desktop::new(self.zones.clone())
     }
 
-    /// Disable (if needed), set new barriers, enable and reconnect libei.
+    /// Arm barriers for `edges`. The first call with edges sets the barriers,
+    /// connects libei and enables the session; later calls only change which
+    /// barriers are live, or schedule a new session when a barrier is missing.
     async fn configure(&mut self, edges: &[Edge]) -> anyhow::Result<()> {
+        self.live = edges.to_vec();
         if self.enabled {
-            self.ic.disable(&self.session, DisableOptions::default()).await?;
-            self.enabled = false;
-            self.activation = None;
-        }
-        if self.ei.take().is_some() {
-            // Let the compositor notice the old libei client went away before
-            // a new one connects (it only accepts one client per session).
-            tokio::time::sleep(Duration::from_millis(250)).await;
+            let armed: Vec<Edge> = self.barriers.values().copied().collect();
+            if edges.iter().all(|e| armed.contains(e)) {
+                self.restart_at = None;
+                if edges.is_empty() {
+                    tracing::info!("no screen edges lead anywhere; capture idle");
+                }
+            } else {
+                tracing::info!("screen edges changed to {edges:?}; a new input capture session is needed");
+                self.restart_at = Some(Instant::now() + RESTART_DELAY);
+            }
+            return Ok(());
         }
         let desk = self.desktop();
         let mut barriers = Vec::new();
@@ -174,6 +193,10 @@ impl Capture {
                 next_id += 1;
             }
         }
+        if barriers.is_empty() {
+            tracing::info!("no screen edges lead anywhere; capture idle");
+            return Ok(());
+        }
         let resp = self
             .ic
             .set_pointer_barriers(&self.session, &barriers, self.zone_set, SetPointerBarriersOptions::default())
@@ -184,13 +207,16 @@ impl Capture {
             self.barriers.remove(&failed.get());
         }
         if self.barriers.is_empty() {
-            tracing::info!("no screen edges lead anywhere; capture idle");
+            tracing::warn!("the compositor rejected every screen edge barrier");
             return Ok(());
         }
-        let fd = self.ic.connect_to_eis(&self.session, ConnectToEISOptions::default()).await?;
-        let context = ei::Context::new(UnixStream::from(fd))?;
-        let (_conn, events) = context.handshake_tokio("kvmbridge-capture", ei::handshake::ContextType::Receiver).await?;
-        self.ei = Some(EiConn { context, events });
+        if self.ei.is_none() {
+            let fd = self.ic.connect_to_eis(&self.session, ConnectToEISOptions::default()).await?;
+            let context = ei::Context::new(UnixStream::from(fd))?;
+            let (_conn, events) =
+                context.handshake_tokio("kvmbridge-capture", ei::handshake::ContextType::Receiver).await?;
+            self.ei = Some(EiConn { context, events });
+        }
         self.ic.enable(&self.session, EnableOptions::default()).await?;
         self.enabled = true;
         tracing::info!("input capture armed on {:?}", self.barriers.values().collect::<Vec<_>>());
@@ -230,7 +256,15 @@ impl Capture {
         }
 
         loop {
+            let restart_at = self.restart_at;
             tokio::select! {
+                _ = tokio::time::sleep_until(restart_at.unwrap_or_else(Instant::now)), if restart_at.is_some() => {
+                    if self.activation.is_none() {
+                        return Exit::Restart;
+                    }
+                    // Not while the cursor is on another screen.
+                    self.restart_at = Some(Instant::now() + RESTART_DELAY);
+                }
                 cmd = side.commands.recv() => match cmd {
                     None => return Exit::ChannelClosed,
                     Some(CaptureCommand::SetEdges(e)) => {
@@ -255,6 +289,10 @@ impl Capture {
                     let pos = a.cursor_position().map(|(x, y)| kvmbridge_core::types::Point::new(x as f64, y as f64));
                     self.activation = Some(id);
                     match (edge, pos) {
+                        (Some(edge), Some(pos)) if !self.live.contains(&edge) => {
+                            // An edge that led somewhere earlier in this session.
+                            self.release(Some((pos.x, pos.y))).await;
+                        }
                         (Some(edge), Some(pos)) => {
                             let _ = side.events.send(CaptureEvent::Activated { edge, pos });
                         }
@@ -270,37 +308,31 @@ impl Capture {
                     }
                 }
                 Some(_d) = disabled.next() => {
-                    // The compositor disabled us (e.g. the user pressed the
-                    // "cancel input capture" shortcut). Re-arm.
-                    tracing::info!("input capture disabled by the compositor; re-arming");
-                    self.enabled = false;
+                    // The user ended input capture (Super+Shift+Esc or the top
+                    // bar). GNOME cannot re-enable this session, and a new one
+                    // asks for permission, so wait for Retry.
                     if self.activation.take().is_some() {
                         let _ = side.events.send(CaptureEvent::Deactivated);
                     }
-                    tokio::time::sleep(Duration::from_millis(300)).await;
-                    if let Err(e) = self.configure(edges).await {
-                        return Exit::Failed(format!("{e:#}"));
-                    }
+                    return Exit::Failed("it was turned off on this computer. Click Retry to turn it back on".into());
                 }
                 Some(_z) = zones_changed.next() => {
                     if let Err(e) = self.refresh_zones().await {
                         return Exit::Failed(format!("{e:#}"));
                     }
                     let _ = side.events.send(CaptureEvent::Geometry(self.desktop()));
-                    if let Err(e) = self.configure(edges).await {
+                    if self.enabled {
+                        // Barriers belong to the old monitor layout.
+                        tracing::info!("monitors changed; a new input capture session is needed");
+                        self.restart_at = Some(Instant::now() + RESTART_DELAY);
+                    } else if let Err(e) = self.configure(edges).await {
                         return Exit::Failed(format!("{e:#}"));
                     }
                 }
                 ev = next_ei(&mut self.ei) => match ev {
                     Some(Ok(ev)) => self.on_ei(side, ev),
-                    Some(Err(e)) => {
-                        tracing::warn!("libei error: {e}");
-                        self.ei = None;
-                    }
-                    None => {
-                        tracing::info!("libei connection closed");
-                        self.ei = None;
-                    }
+                    Some(Err(e)) => return Exit::Failed(format!("libei error: {e}")),
+                    None => return Exit::Failed("the libei connection closed".into()),
                 },
             }
         }

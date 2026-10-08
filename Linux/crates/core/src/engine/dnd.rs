@@ -1,11 +1,12 @@
 //! Drag-and-drop of files between screens.
 //!
-//! Controller side: when the cursor leaves this screen the platform is asked
-//! to *probe* for a file drag in progress. If one is found, the files start
-//! streaming to the target right away and the target is told to begin a
-//! native drag under its cursor. When the user lets go of the button on the
-//! target, the drop lands in whatever application is under the cursor; that
-//! application receives the files once the transfer has completed.
+//! Controller side: a mouse button held while the cursor left this screen
+//! and let go on another one may have dragged files along. Only then the
+//! platform is asked to *probe* for a file drag in progress (normal crossings
+//! show nothing). If one is found, the files start streaming to the target
+//! and the target begins a native drag under its cursor and drops it right
+//! away, into whatever application is there; that application receives the
+//! files once the transfer has completed.
 
 use super::*;
 use crate::platform::ProbeOutcome;
@@ -44,17 +45,32 @@ impl Engine {
         self.st.enabled && self.st.settings.transfers.drag_and_drop && self.backends.dnd.is_ready()
     }
 
-    pub(crate) fn start_drag_probe(&mut self, pos: crate::types::Point) {
+    /// The cursor just left this screen: forget an earlier probe.
+    pub(crate) fn drag_crossed_out(&mut self) {
         if let Some(old) = self.dnd.probe.take() {
             let _ = self.dndcmd.send(DndCommand::ProbeDone { probe: old, outcome: ProbeOutcome::Abandoned });
         }
         self.flush_drag_outcome();
-        if !self.dnd_enabled() {
-            return;
+    }
+
+    /// `button` was held while the cursor left this screen and has just been
+    /// let go on another one. Returns true if a probe for a file drag takes
+    /// the release over (the target never saw the press anyway).
+    pub(crate) fn probe_drag(&mut self, button: u32) -> bool {
+        if button != crate::types::buttons::BTN_LEFT
+            || !self.dnd_enabled()
+            || self.dnd.probe.is_some()
+            || self.dnd.outgoing.is_some()
+        {
+            return false;
         }
+        let Input::Controlling(c) = &self.input else { return false };
+        // The local pointer is still where it left the screen.
+        let pos = c.exit_pos;
         let probe = crate::crypto::random_u64();
         self.dnd.probe = Some(probe);
         let _ = self.dndcmd.send(DndCommand::Probe { probe, pos });
+        true
     }
 
     pub(crate) fn on_dnd(&mut self, ev: DndEvent) {
@@ -216,11 +232,11 @@ impl Engine {
         let desk = self.local_desktop();
         let b = desk.bounds();
         let pos = crate::types::Point::new(b.x + b.w / 2.0, b.y + b.h / 2.0);
-        let _ = self.dndcmd.send(DndCommand::StartDrag { drag, names: vec!["KVM Bridge test.txt".into()], pos });
-        let emu = self.emu.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(seconds)).await;
-            let _ = emu.send(EmulationCommand::Button { button: crate::types::buttons::BTN_LEFT, pressed: false });
+        let _ = self.dndcmd.send(DndCommand::StartDrag {
+            drag,
+            names: vec!["KVM Bridge test.txt".into()],
+            pos,
+            drop_after_ms: seconds * 1000,
         });
         Ok(())
     }
@@ -249,7 +265,9 @@ impl Engine {
         let pos = self.controlled_pos().unwrap_or_default();
         let names = items.into_iter().map(|i| i.rel_path).collect();
         self.dnd.incoming.insert(drag, InDrag { peer, transfer: None, result: None, reply: None, ended: false });
-        let _ = self.dndcmd.send(DndCommand::StartDrag { drag, names, pos });
+        // The user already let go on the controller: drop as soon as the
+        // application under the cursor has seen the drag.
+        let _ = self.dndcmd.send(DndCommand::StartDrag { drag, names, pos, drop_after_ms: 250 });
     }
 
     pub(crate) fn dnd_transfer_offered(&mut self, peer: DeviceId, drag: u64, local_transfer: u64) {

@@ -33,6 +33,14 @@ impl Desktop {
         self.monitors.iter().any(|m| m.contains(p))
     }
 
+    /// Where to leave the pointer while another screen has it: the
+    /// bottom-right corner, where only the tip of the arrow is on screen.
+    pub fn park_point(&self) -> Point {
+        let b = self.bounds();
+        let m = self.monitors.iter().max_by(|a, c| (a.x + a.w + a.y + a.h).total_cmp(&(c.x + c.w + c.y + c.h))).unwrap_or(&b);
+        Point::new(m.x + m.w - 1.0, m.y + m.h - 1.0)
+    }
+
     /// Nearest point that lies on one of the monitors.
     pub fn clamp(&self, p: Point) -> Point {
         if self.monitors.is_empty() {

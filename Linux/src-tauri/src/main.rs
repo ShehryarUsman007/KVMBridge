@@ -79,12 +79,35 @@ fn forward_events(app: AppHandle, engine: EngineHandle) {
     });
 }
 
+/// Hands the command line to a KVM Bridge that is already running, through
+/// the D-Bus object of the single-instance plugin. This happens before
+/// anything else starts, so a second launch does not touch the log, the
+/// network ports or the desktop permissions. Returns true if one took it.
+#[cfg(target_os = "linux")]
+fn forward_to_running_instance(args: &[String]) -> bool {
+    // Must match the identifier in tauri.conf.json.
+    const NAME: &str = "io.kvmbridge.app.SingleInstance";
+    const PATH: &str = "/io/kvmbridge/app/SingleInstance";
+    let Ok(conn) = zbus::blocking::Connection::session() else { return false };
+    let cwd = std::env::current_dir().ok().and_then(|d| d.to_str().map(String::from)).unwrap_or_default();
+    conn.call_method(Some(NAME), PATH, Some("org.SingleInstance.DBus"), "ExecuteCallback", &(args, cwd)).is_ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn forward_to_running_instance(_args: &[String]) -> bool {
+    false
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if let Some(i) = args.iter().position(|a| a == "--home") {
         if let Some(dir) = args.get(i + 1) {
             std::env::set_var("KVMBRIDGE_HOME", dir);
         }
+    }
+    // A separate profile (--home / KVMBRIDGE_HOME) may run next to the default one.
+    if std::env::var_os("KVMBRIDGE_HOME").is_none() && forward_to_running_instance(&args) {
+        return;
     }
     let minimized_flag = args.iter().any(|a| a == "--minimized") && backup::config_file_arg(&args).is_none();
     let paths = Paths::discover();

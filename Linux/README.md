@@ -37,15 +37,25 @@ needs.
 Install KVM Bridge on every computer that should take part.
 
 The computers talk over UDP port 47800 (discovery) and TCP port 47801
-(connections). Ubuntu and Fedora Workstation allow these by default. If you
-run a firewall that blocks them, allow both ports on the local network.
+(connections). If a computer does not show up, a firewall is the usual cause.
+The packages include firewall rules for KVM Bridge; allow them on the local
+network (replace `192.168.1.0/24` with your network):
+
+```bash
+sudo ufw allow from 192.168.1.0/24 to any app "KVM Bridge"     # Ubuntu, Debian (ufw)
+sudo firewall-cmd --permanent --add-service=kvmbridge && sudo firewall-cmd --reload   # Fedora (firewalld)
+```
+
+Fedora Workstation already allows these ports; Ubuntu's firewall is off unless
+you switched it on.
 
 ## First start
 
 GNOME asks for two permissions the first time:
 
 1. **Input capture**: lets this computer's keyboard and mouse move to other
-   screens. GNOME asks again on every start.
+   screens. GNOME asks again on every start, and when a screen is moved to a
+   side of this one that had no screen before.
 2. **Remote desktop**: lets other computers move the cursor and type here.
    KVM Bridge remembers this one.
 
@@ -53,7 +63,13 @@ If you dismiss one, open **Status** and click **Retry permissions**.
 
 To take the keyboard and mouse back from KVM Bridge at any time, press
 `Ctrl+Alt+Shift+Esc`. GNOME's own shortcut for ending input capture,
-`Super+Shift+Esc`, works too.
+`Super+Shift+Esc`, works too, but it switches input capture off until you
+click **Retry** on **Status**.
+
+While another computer has the cursor, the screen you left keeps showing the
+pointer where it crossed: GNOME holds it there and does not let applications
+hide it. A computer that is being controlled tucks its own pointer into the
+bottom-right corner when the cursor moves on.
 
 ## Using it
 

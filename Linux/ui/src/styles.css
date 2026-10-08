@@ -442,6 +442,31 @@ textarea.input {
   border: 1px dashed var(--border-strong);
   border-radius: var(--radius-lg);
 }
+.firewall-hint {
+  margin-top: 8px;
+  padding: 0 2px;
+}
+.firewall-hint p {
+  margin: 6px 0;
+}
+.firewall-hint dl {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 4px 12px;
+  margin: 6px 0;
+}
+.firewall-hint dt {
+  white-space: nowrap;
+}
+.firewall-hint dd {
+  margin: 0;
+  min-width: 0;
+}
+.firewall-hint code {
+  overflow-wrap: anywhere;
+  user-select: all;
+  color: var(--text);
+}
 .kv {
   display: grid;
   grid-template-columns: 100px 1fr;

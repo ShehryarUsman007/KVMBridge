@@ -1,0 +1,4 @@
+[KVM Bridge]
+title=KVM Bridge
+description=Shares one keyboard and mouse, the clipboard and files between computers
+ports=47800/udp|47801/tcp

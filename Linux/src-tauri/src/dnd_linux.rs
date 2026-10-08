@@ -7,14 +7,18 @@
 //! * **Receiving** (`StartDrag`): a window is shown on the monitor under the
 //!   remote-controlled cursor and a button press is injected into it. That
 //!   press starts a native drag of the incoming files; the window then lets
-//!   input through, so the drag can land in any application. When that
-//!   application asks for the data, we wait until the files have arrived
-//!   and hand it their local paths.
-//! * **Sending** (`Probe`): when the cursor leaves this screen, a drop target
-//!   is shown under it. A file drag in progress enters it, which tells us
-//!   the files. When the cursor is back (`ProbeDone`) and the files were
-//!   dropped elsewhere, drop targets that decline are put on every monitor
-//!   and the local drag is ended on them, so nothing lands here by accident.
+//!   input through, and a release injected a moment later drops the files on
+//!   the application under the cursor. When that application asks for the
+//!   data, we wait until the files have arrived and hand it their local paths.
+//! * **Sending** (`Probe`): when a button held while the cursor left this
+//!   screen is let go elsewhere, a drop target is shown under the (frozen)
+//!   local pointer. A file drag in progress enters it, which tells us the
+//!   files. When the cursor is back (`ProbeDone`) and the files were dropped
+//!   elsewhere, drop targets that decline are put on every monitor and the
+//!   local drag is ended on them, so nothing lands here by accident.
+//!
+//! The windows are fully transparent; their CSS background is cleared too,
+//! or GTK tells the compositor they are opaque and they show up black.
 
 use gtk::prelude::*;
 use gtk::{cairo, gdk, glib};
@@ -68,7 +72,9 @@ fn on_command(cmd: DndCommand, events: Events) {
     match cmd {
         DndCommand::Probe { probe, pos } => start_probe(probe, pos, events),
         DndCommand::ProbeDone { probe, outcome } => finish_probe(probe, outcome, events),
-        DndCommand::StartDrag { drag, names, pos } => start_drag(drag, names, pos, events),
+        DndCommand::StartDrag { drag, names, pos, drop_after_ms } => {
+            start_drag(drag, names, pos, Duration::from_millis(drop_after_ms), events)
+        }
         DndCommand::CancelDrag { drag } => cancel_drag(drag),
     }
 }
@@ -86,6 +92,10 @@ fn overlay(pos: Option<Point>, index: Option<i32>) -> gtk::Window {
         if let Some(v) = screen.rgba_visual() {
             win.set_visual(Some(&v));
         }
+    }
+    let css = gtk::CssProvider::new();
+    if css.load_from_data(b"window { background-color: transparent; }").is_ok() {
+        win.style_context().add_provider(&css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
     }
     win.connect_draw(|_, cr| {
         cr.set_operator(cairo::Operator::Source);
@@ -301,7 +311,7 @@ fn end_drag(st: &Rc<RefCell<DragState>>, accepted: bool) {
     glib::idle_add_local_once(move || close_drag(id));
 }
 
-fn start_drag(id: u64, names: Vec<String>, pos: Point, events: Events) {
+fn start_drag(id: u64, names: Vec<String>, pos: Point, drop_after: Duration, events: Events) {
     if let Some(old) = DRAG.with(|d| d.borrow_mut().take()) {
         if let Some(ctx) = old.st.borrow().ctx.clone() {
             ctx.drag_cancel();
@@ -335,6 +345,7 @@ fn start_drag(id: u64, names: Vec<String>, pos: Point, events: Events) {
                     st.borrow_mut().ctx = Some(ctx);
                     // Let the drag reach the applications under this window.
                     w.input_shape_combine_region(Some(&cairo::Region::create()));
+                    drop_later(&st, drop_after);
                 }
                 None => {
                     tracing::warn!("could not start a native drag");
@@ -391,6 +402,27 @@ fn start_drag(id: u64, names: Vec<String>, pos: Point, events: Events) {
     }
     win.show_all();
     DRAG.with(|d| *d.borrow_mut() = Some(NativeDrag { id, win, st }));
+}
+
+/// Drop the drag wherever the cursor is after `delay`: a small nudge makes the
+/// compositor send the application under it a drag motion, then the button
+/// is let go.
+fn drop_later(st: &Rc<RefCell<DragState>>, delay: Duration) {
+    let st = st.clone();
+    glib::timeout_add_local_once(delay, move || {
+        let (ended, events) = {
+            let s = st.borrow();
+            (s.ended, s.events.clone())
+        };
+        if ended {
+            return;
+        }
+        let _ = events.send(DndEvent::InjectMove { dx: 1.0, dy: 0.0 });
+        let _ = events.send(DndEvent::InjectMove { dx: -1.0, dy: 0.0 });
+        glib::timeout_add_local_once(Duration::from_millis(100), move || {
+            let _ = events.send(DndEvent::InjectButton { pressed: false });
+        });
+    });
 }
 
 /// The drop target wants the data: wait (keeping the UI responsive) until

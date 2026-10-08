@@ -2234,7 +2234,7 @@ dependencies = [
 
 [[package]]
 name = "kvmbridge"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "gtk",
@@ -2252,11 +2252,12 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "zbus",
 ]
 
 [[package]]
 name = "kvmbridge-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2286,7 +2287,7 @@ dependencies = [
 
 [[package]]
 name = "kvmbridge-platform"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "ashpd",

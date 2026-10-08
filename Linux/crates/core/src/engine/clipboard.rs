@@ -44,6 +44,11 @@ impl Engine {
         self.st.enabled && self.st.settings.clipboard.enabled
     }
 
+    /// A peer's name for the log.
+    fn peer_label(&self, peer: DeviceId) -> String {
+        self.peers.get(&peer).map_or_else(|| format!("{peer:?}"), |p| p.name.clone())
+    }
+
     pub(crate) fn shareable_formats(&self, f: &[ClipFormat]) -> Vec<ClipFormat> {
         f.iter().copied().filter(|x| *x != ClipFormat::Files || self.st.settings.clipboard.files).collect()
     }
@@ -58,6 +63,7 @@ impl Engine {
             }
             ClipboardEvent::LocalChanged { formats } => {
                 if !self.clipboard_on() {
+                    tracing::info!("clipboard changed here; sharing is off");
                     return;
                 }
                 self.clip.local_seq += 1;
@@ -65,17 +71,20 @@ impl Engine {
                 self.clip.local = Some((seq, formats.clone()));
                 self.clip.remote = None;
                 let share = self.shareable_formats(&formats);
-                tracing::debug!("local clipboard changed: {formats:?}");
+                let peers = self.connected_peers().len();
+                tracing::info!("clipboard changed here ({formats:?}); offering {share:?} to {peers} computer(s)");
                 if !share.is_empty() {
                     self.broadcast(Msg::ClipOffer { seq, formats: share });
                 }
             }
             ClipboardEvent::Paste { offer, format, reply } => {
                 let Some(r) = self.clip.remote.as_ref().filter(|r| r.offer == offer && r.formats.contains(&format)) else {
+                    tracing::info!("paste of {format:?} here: no matching clipboard offer from another computer");
                     let _ = reply.send(None);
                     return;
                 };
                 let (peer, seq) = (r.peer, r.seq);
+                tracing::info!("paste of {format:?} here; asking {}", self.peer_label(peer));
                 self.clip.next_req += 1;
                 let req = self.clip.next_req;
                 if self.send_to(peer, Msg::ClipRequest { req, seq, format }) {
@@ -91,13 +100,15 @@ impl Engine {
     }
 
     pub(crate) fn on_clip_offer(&mut self, peer: DeviceId, seq: u64, formats: Vec<ClipFormat>) {
-        if !self.clipboard_on() || formats.is_empty() {
+        if !self.clipboard_on() {
+            tracing::info!("ignoring clipboard from {}: sharing is off here", self.peer_label(peer));
             return;
         }
         let formats = self.shareable_formats(&formats);
         if formats.is_empty() {
             return;
         }
+        tracing::info!("clipboard from {} ({formats:?}) is now available here", self.peer_label(peer));
         self.clip.next_offer += 1;
         let offer = self.clip.next_offer;
         self.clip.remote = Some(RemoteClip { peer, seq, offer, formats: formats.clone() });
@@ -110,9 +121,11 @@ impl Engine {
             && self.clip.local.as_ref().is_some_and(|(s, f)| *s == seq && f.contains(&format))
             && (format != ClipFormat::Files || self.st.settings.clipboard.files);
         if !ok {
+            tracing::info!("{} asked for {format:?}, which this clipboard no longer offers", self.peer_label(peer));
             self.send_to(peer, Msg::ClipData { req, data: None });
             return;
         }
+        tracing::info!("{} is pasting {format:?} from this clipboard", self.peer_label(peer));
         let (tx, rx) = oneshot::channel();
         let _ = self.clipcmd.send(ClipboardCommand::Read { format, reply: tx });
         let internal = self.internal.clone();
@@ -124,6 +137,7 @@ impl Engine {
 
     pub(crate) fn on_clip_read_done(&mut self, peer: DeviceId, req: u64, format: ClipFormat, data: Option<Vec<u8>>) {
         let Some(data) = data else {
+            tracing::warn!("could not read {format:?} from the clipboard here");
             self.send_to(peer, Msg::ClipData { req, data: None });
             return;
         };
@@ -150,6 +164,10 @@ impl Engine {
     pub(crate) fn on_clip_data(&mut self, peer: DeviceId, req: u64, data: Option<Vec<u8>>) {
         if let Some(p) = self.clip.pending.remove(&req) {
             if p.peer == peer {
+                match &data {
+                    Some(d) => tracing::info!("received {} bytes of {:?} from {}", d.len(), p.format, self.peer_label(peer)),
+                    None => tracing::info!("{} had no {:?} to paste", self.peer_label(peer), p.format),
+                }
                 let _ = p.reply.send(data);
             }
         }

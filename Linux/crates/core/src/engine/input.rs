@@ -25,6 +25,8 @@ pub(crate) struct Controlling {
     /// Keys whose press was consumed by a hotkey (their release is dropped too).
     pub swallowed: HashSet<u32>,
     pub buttons: HashSet<u32>,
+    /// Buttons pressed at any time since the cursor left this device.
+    pub seen_buttons: HashSet<u32>,
     /// Where the cursor left this device (to put it back there on release).
     pub exit_edge: Edge,
     pub exit_pos: Point,
@@ -196,13 +198,20 @@ impl Engine {
             CaptureEvent::Motion { dx, dy } => self.on_motion(dx, dy),
             CaptureEvent::Button { button, pressed } => {
                 if let Input::Controlling(c) = &mut self.input {
+                    // Released without a press since the cursor left: it was
+                    // held while crossing, maybe dragging files along.
+                    let held_across = !pressed && !c.seen_buttons.contains(&button);
                     if pressed {
                         c.buttons.insert(button);
+                        c.seen_buttons.insert(button);
                     } else {
                         c.buttons.remove(&button);
                     }
                     let t = c.target;
                     self.flush_motion();
+                    if held_across && self.probe_drag(button) {
+                        return;
+                    }
                     self.send_to(t, Msg::Button { button, pressed });
                 }
             }
@@ -268,10 +277,11 @@ impl Engine {
             held: HashSet::new(),
             swallowed: HashSet::new(),
             buttons: HashSet::new(),
+            seen_buttons: HashSet::new(),
             exit_edge: edge,
             exit_pos: pos,
         }));
-        self.start_drag_probe(pos);
+        self.drag_crossed_out();
         self.mark_dirty();
     }
 
@@ -431,7 +441,7 @@ impl Engine {
         }
         if self.controlled.as_ref().is_some_and(|c| c.peer == peer) {
             self.controlled = None;
-            let _ = self.emu.send(EmulationCommand::Leave);
+            let _ = self.emu.send(EmulationCommand::Leave { park: None });
             self.update_edges();
         }
         self.clip_peer_gone(peer);
@@ -467,7 +477,9 @@ impl Engine {
     pub(crate) fn on_remote_leave(&mut self, peer: DeviceId, session: u32) {
         if self.controlled.as_ref().is_some_and(|c| c.peer == peer && c.session == session) {
             self.controlled = None;
-            let _ = self.emu.send(EmulationCommand::Leave);
+            // The cursor moved on to another screen: tuck this one away.
+            let park = self.local_desktop().park_point();
+            let _ = self.emu.send(EmulationCommand::Leave { park: Some(park) });
             self.update_edges();
             self.mark_dirty();
         }

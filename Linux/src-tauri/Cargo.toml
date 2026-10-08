@@ -31,3 +31,4 @@ parking_lot.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = "0.18"
+zbus = "5.9"

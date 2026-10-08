@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { api, PeerView } from "../api";
 import { cipherLabel, useEngine } from "../store";
 import { IconCheck, IconLaptop, IconLinux, IconMonitor, IconPlus, IconTrash, IconUpload, IconWifi, IconWindows } from "../components/Icons";
@@ -24,6 +24,46 @@ function statusText(p: PeerView): string {
     default:
       return "Available";
   }
+}
+
+/** The local /24 network of the first private IPv4 address, e.g. "192.168.2.0/24". */
+function localSubnet(addresses: string[]): string | null {
+  for (const a of addresses) {
+    const m = /^(10|172|192)\.(\d+)\.(\d+)\.\d+$/.exec(a);
+    if (m) return `${m[1]}.${m[2]}.${m[3]}.0/24`;
+  }
+  return null;
+}
+
+/** Shown when nothing has been found for a while: the usual cause is a firewall. */
+function FirewallHint({ addresses }: { addresses: string[] }) {
+  const [show, setShow] = useState(false);
+  useEffect(() => {
+    const t = window.setTimeout(() => setShow(true), 8000);
+    return () => window.clearTimeout(t);
+  }, []);
+  if (!show) return null;
+  const subnet = localSubnet(addresses);
+  const ufw = subnet ? `sudo ufw allow from ${subnet} to any app "KVM Bridge"` : `sudo ufw allow "KVM Bridge"`;
+  return (
+    <div className="firewall-hint muted small">
+      <p>
+        Still nothing? A firewall may be blocking KVM Bridge (UDP port 47800 and TCP port 47801). Allow it on each
+        computer that has a firewall switched on:
+      </p>
+      <dl>
+        <dt>Ubuntu, Debian (ufw)</dt>
+        <dd>
+          <code className="mono">{ufw}</code>
+        </dd>
+        <dt>Fedora (firewalld)</dt>
+        <dd>
+          <code className="mono">sudo firewall-cmd --permanent --add-service=kvmbridge && sudo firewall-cmd --reload</code>
+        </dd>
+      </dl>
+      <p>Or add the computer by its address below.</p>
+    </div>
+  );
 }
 
 export function DevicesPage() {
@@ -160,9 +200,12 @@ export function DevicesPage() {
         </div>
       )}
       {nearby.length === 0 ? (
-        <div className="empty-state">
-          <IconWifi /> Looking for other computers running KVM Bridge… Make sure it's running on them and that they're on the same network.
-        </div>
+        <>
+          <div className="empty-state">
+            <IconWifi /> Looking for other computers running KVM Bridge… Make sure it's running on them and that they're on the same network.
+          </div>
+          {paired.length === 0 && <FirewallHint addresses={snap.me.addresses} />}
+        </>
       ) : (
         <div className="device-list">
           {nearby.map((p) => (
