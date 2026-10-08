@@ -5,6 +5,7 @@
 mod capture;
 pub mod guard;
 mod remote;
+pub mod selection;
 
 use kvmbridge_core::platform::*;
 use kvmbridge_core::types::ClipFormat;

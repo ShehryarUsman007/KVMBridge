@@ -5,7 +5,7 @@
 //! The permission is persisted with a restore token so the dialog is only
 //! shown the first time.
 
-use super::{clipboard_mimes, mime_to_format, now_us};
+use super::{clipboard_mimes, mime_to_format, now_us, selection};
 use ashpd::desktop::clipboard::{Clipboard, RequestClipboardOptions, SetSelectionOptions};
 use ashpd::desktop::remote_desktop::{
     ConnectToEISOptions, DeviceType, RemoteDesktop, SelectDevicesOptions, StartOptions,
@@ -228,16 +228,21 @@ impl Remote {
         // Signal streams (separate proxy so they do not borrow `self`).
         let sig = if cbctx.is_some() { Clipboard::new().await.ok() } else { None };
         let (mut owner_changed, mut transfers) = match &sig {
-            Some(sig) => match futures::try_join!(
-                sig.receive_selection_owner_changed::<RemoteDesktop>(),
-                sig.receive_selection_transfer::<RemoteDesktop>()
-            ) {
-                Ok((a, b)) => (Some(a.boxed()), Some(b.boxed())),
-                Err(e) => {
-                    tracing::warn!("clipboard signals unavailable: {e}");
-                    (None, None)
+            Some(sig) => {
+                // Owner changes are decoded by `selection`, not ashpd (see there).
+                let owner = sig.receive_signal("SelectionOwnerChanged").await.map_err(|e| e.to_string());
+                let transfer = sig.receive_selection_transfer::<RemoteDesktop>().await.map_err(|e| e.to_string());
+                match (owner, transfer) {
+                    (Ok(a), Ok(b)) => (
+                        Some(a.filter_map(|m| std::future::ready(selection::owner_change(&m))).boxed()),
+                        Some(b.boxed()),
+                    ),
+                    (Err(e), _) | (_, Err(e)) => {
+                        tracing::warn!("clipboard signals unavailable: {e}");
+                        (None, None)
+                    }
                 }
-            },
+            }
             None => (None, None),
         };
         match &cbctx {
@@ -277,9 +282,9 @@ impl Remote {
                 },
                 // Portals only deliver session signals to the session owner,
                 // and we own exactly one remote desktop session.
-                Some((_session, info)) = next_opt(&mut owner_changed) => {
-                    if info.session_is_owner() == Some(true) { continue; }
-                    let mimes: Vec<String> = info.mime_types().to_vec();
+                Some(change) = next_opt(&mut owner_changed) => {
+                    if change.session_is_owner { continue; }
+                    let mimes = change.mime_types;
                     let mut formats: Vec<ClipFormat> = Vec::new();
                     for m in &mimes {
                         if let Some(f) = mime_to_format(m) {
