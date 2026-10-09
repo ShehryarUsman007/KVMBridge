@@ -2234,7 +2234,7 @@ dependencies = [
 
 [[package]]
 name = "kvmbridge"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "gtk",
@@ -2257,7 +2257,7 @@ dependencies = [
 
 [[package]]
 name = "kvmbridge-core"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2287,7 +2287,7 @@ dependencies = [
 
 [[package]]
 name = "kvmbridge-platform"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "ashpd",
@@ -2296,6 +2296,8 @@ dependencies = [
  "libc",
  "parking_lot",
  "reis",
+ "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing",

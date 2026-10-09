@@ -11,6 +11,10 @@
 //!   barrier but are released at once when hit; an edge that needs a new
 //!   barrier (a screen moved to another side, monitors changed) starts a new
 //!   session after the arrangement has settled.
+//! * while a session holds input, mutter swallows every key and pointer
+//!   event, the power key included, until it is released. If releasing ever
+//!   fails, or the portal frontend went away (see [`super::portal`]), the
+//!   session is closed at the portal backend directly and set up again.
 
 use ashpd::desktop::input_capture::{
     ActivatedBarrier, Barrier, Capabilities, ConnectToEISOptions, CreateSessionOptions,
@@ -19,6 +23,7 @@ use ashpd::desktop::input_capture::{
 use ashpd::desktop::Session;
 use futures::StreamExt;
 use super::guard::Guard;
+use super::portal;
 use kvmbridge_core::layout::Desktop;
 use kvmbridge_core::platform::{BackendSide, BackendStatus, CaptureCommand, CaptureEvent};
 use kvmbridge_core::types::{Edge, Rect};
@@ -62,7 +67,11 @@ pub async fn run(mut side: Side, guard: Guard) {
             Ok(mut cap) => {
                 let reason = cap.serve(&mut side, &mut edges).await;
                 let _ = cap.ic.release(&cap.session, ReleaseOptions::default()).await;
-                let _ = cap.session.close().await;
+                if cap.session.close().await.is_err() {
+                    if let Some(h) = &cap.handle {
+                        portal::close_at_backend(h, "input capture").await;
+                    }
+                }
                 match reason {
                     Exit::ChannelClosed => return,
                     Exit::Restart => continue,
@@ -112,6 +121,8 @@ enum Exit {
 struct Capture {
     ic: InputCapture,
     session: Session<InputCapture>,
+    /// The session's handle, to close it at the backend if need be.
+    handle: Option<String>,
     zones: Vec<Rect>,
     zone_set: u32,
     barriers: HashMap<u32, Edge>,
@@ -141,9 +152,11 @@ impl Capture {
             )
             .await?;
         tracing::info!("input capture session created (capabilities: {caps:?})");
+        let handle = portal::handle_of(&session);
         let mut c = Capture {
             ic,
             session,
+            handle,
             zones: vec![],
             zone_set: 0,
             barriers: HashMap::new(),
@@ -238,15 +251,34 @@ impl Capture {
         Ok(())
     }
 
-    async fn release(&mut self, pos: Option<(f64, f64)>) {
-        let Some(act) = self.activation.take() else { return };
+    /// Give input back to this computer. Returns false if that failed, in
+    /// which case mutter may be holding all input with nobody to release it.
+    async fn release(&mut self, pos: Option<(f64, f64)>) -> bool {
+        let Some(act) = self.activation.take() else { return true };
         let mut opts = ReleaseOptions::default().set_activation_id(act);
         if let Some(p) = pos {
             opts = opts.set_cursor_position(p);
         }
-        if let Err(e) = self.ic.release(&self.session, opts).await {
-            tracing::debug!("release failed: {e}");
+        match self.ic.release(&self.session, opts).await {
+            Ok(_) => true,
+            // Already ended (e.g. Super+Shift+Esc): input is free.
+            Err(e) if e.to_string().contains("not active") => true,
+            Err(e) => {
+                tracing::warn!("giving input back failed: {e}");
+                false
+            }
         }
+    }
+
+    /// Our handle on the session is gone (or does not work): end the session
+    /// at the portal backend so that it cannot keep holding input.
+    async fn orphaned(&mut self, why: &str) -> Exit {
+        tracing::warn!("{why}; ending the input capture session at the desktop portal");
+        if let Some(h) = &self.handle {
+            portal::close_at_backend(h, "input capture").await;
+        }
+        self.activation = None;
+        Exit::Restart
     }
 
     async fn serve(&mut self, side: &mut Side, edges: &mut Vec<Edge>) -> Exit {
@@ -263,6 +295,13 @@ impl Capture {
         ) {
             Ok(s) => s,
             Err(e) => return Exit::Failed(e.to_string()),
+        };
+        let mut frontend_gone = match portal::frontend_gone().await {
+            Ok(s) => Some(s),
+            Err(e) => {
+                tracing::warn!("cannot watch the desktop portal: {e}");
+                None
+            }
         };
         let _ = side.events.send(CaptureEvent::Geometry(self.desktop()));
         status(side, BackendStatus::Ready("InputCapture portal".into()));
@@ -290,7 +329,12 @@ impl Capture {
                             }
                         }
                     }
-                    Some(CaptureCommand::Release { pos }) => self.release(pos.map(|p| (p.x, p.y))).await,
+                    Some(CaptureCommand::Release { pos }) => {
+                        if !self.release(pos.map(|p| (p.x, p.y))).await {
+                            let _ = side.events.send(CaptureEvent::Deactivated);
+                            return self.orphaned("input could not be given back").await;
+                        }
+                    }
                     Some(CaptureCommand::Enable(_)) => {}
                     Some(CaptureCommand::Restart) => return Exit::Restart,
                     Some(CaptureCommand::BlockLocalInput(b)) => self.guard.set(b),
@@ -306,14 +350,18 @@ impl Capture {
                     match (edge, pos) {
                         (Some(edge), Some(pos)) if !self.live.contains(&edge) => {
                             // An edge that led somewhere earlier in this session.
-                            self.release(Some((pos.x, pos.y))).await;
+                            if !self.release(Some((pos.x, pos.y))).await {
+                                return self.orphaned("input could not be given back").await;
+                            }
                         }
                         (Some(edge), Some(pos)) => {
                             let _ = side.events.send(CaptureEvent::Activated { edge, pos });
                         }
                         _ => {
                             tracing::debug!("activation without usable barrier/position; releasing");
-                            self.release(None).await;
+                            if !self.release(None).await {
+                                return self.orphaned("input could not be given back").await;
+                            }
                         }
                     }
                 }
@@ -343,6 +391,12 @@ impl Capture {
                     } else if let Err(e) = self.configure(edges).await {
                         return Exit::Failed(format!("{e:#}"));
                     }
+                }
+                Some(()) = portal::next_opt(&mut frontend_gone) => {
+                    if self.activation.is_some() {
+                        let _ = side.events.send(CaptureEvent::Deactivated);
+                    }
+                    return self.orphaned("the desktop portal went away").await;
                 }
                 ev = next_ei(&mut self.ei) => match ev {
                     Some(Ok(ev)) => self.on_ei(side, ev),

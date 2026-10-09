@@ -5,6 +5,7 @@
 //! The permission is persisted with a restore token so the dialog is only
 //! shown the first time.
 
+use super::portal::{self, next_opt};
 use super::{clipboard_mimes, mime_to_format, now_us, selection};
 use ashpd::desktop::clipboard::{Clipboard, RequestClipboardOptions, SetSelectionOptions};
 use ashpd::desktop::remote_desktop::{
@@ -20,11 +21,12 @@ use kvmbridge_core::types::{keys, ClipFormat, Point, Rect};
 use reis::ei;
 use reis::event::{Device, DeviceCapability, EiEvent};
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::oneshot;
 
@@ -32,6 +34,10 @@ type EmuSide = BackendSide<EmulationCommand, EmulationEvent>;
 type ClipSide = BackendSide<ClipboardCommand, ClipboardEvent>;
 
 const MAX_CLIPBOARD: usize = 256 * 1024 * 1024;
+/// Mutter forgets a paste request 15 s after the last one; answer within this.
+const PASTE_DEADLINE: Duration = Duration::from_secs(12);
+/// One copy is sometimes reported twice in a row.
+const DUPLICATE_WINDOW: Duration = Duration::from_millis(500);
 
 /// A session that lasted at least this long counts as a good one when it ends.
 const STABLE_SESSION: Duration = Duration::from_secs(60);
@@ -45,11 +51,15 @@ pub async fn run(mut emu: EmuSide, mut clip: ClipSide, token_file: PathBuf) {
             "Waiting for permission to control this computer…".into(),
         )));
         let _ = clip.events.send(ClipboardEvent::Status(BackendStatus::Starting("Waiting for remote desktop session…".into())));
-        let started = std::time::Instant::now();
+        let started = Instant::now();
         let exit = match Remote::create(&token_file).await {
             Ok(mut r) => {
                 let e = r.serve(&mut emu, &mut clip).await;
-                let _ = r.session.close().await;
+                if r.session.close().await.is_err() {
+                    if let Some(h) = &r.handle {
+                        portal::close_at_backend(h, "remote desktop").await;
+                    }
+                }
                 e
             }
             Err(e) => Exit::Failed(describe(&e)),
@@ -146,6 +156,8 @@ fn dev_id(d: &Device) -> u64 {
 struct Remote {
     rd: RemoteDesktop,
     session: Arc<Session<RemoteDesktop>>,
+    /// The session's handle, to close it at the backend if need be.
+    handle: Option<String>,
     clipboard: Option<Arc<ClipboardCtx>>,
     context: ei::Context,
     connection: reis::event::Connection,
@@ -157,13 +169,25 @@ struct Remote {
     last: Option<Point>,
 }
 
+/// The clipboard of the remote desktop session.
+///
+/// On GNOME 46 a SelectionRead or SelectionWrite that mutter refuses brings
+/// a portal process down: xdg-desktop-portal-gnome answers with garbage, and
+/// either it aborts (failed read) or the xdg-desktop-portal frontend
+/// segfaults (failed write), which orphans our sessions (see
+/// [`super::portal`]). So these calls are only made when mutter will accept
+/// them: one at a time, reads only while another application owns the
+/// clipboard, and writes only for paste requests mutter still waits for.
 struct ClipboardCtx {
     cb: Clipboard,
     session: Arc<Session<RemoteDesktop>>,
-    /// Held for every SelectionRead and SelectionWrite. xdg-desktop-portal-gnome
-    /// 46 aborts on overlapping reads, which ends every portal session of
-    /// this app (and input capture then needs a new permission dialog).
+    /// Held for every SetSelection, SelectionRead and SelectionWrite.
     io: tokio::sync::Mutex<ReadCache>,
+    /// Changes whenever mutter drops the paste requests it waits on: when we
+    /// set the clipboard, or another application takes it.
+    generation: AtomicU64,
+    /// Another application owns the clipboard, so it can be read.
+    readable: AtomicBool,
 }
 
 /// The last clipboard contents read, per mime type. Applications ask for the
@@ -213,15 +237,23 @@ impl Remote {
         tracing::info!("remote desktop session started: devices {:?}, clipboard {clipboard_ok}", started.devices());
         let session = Arc::new(session);
         let clipboard = match (clipboard, clipboard_ok) {
-            (Some(cb), true) => Some(Arc::new(ClipboardCtx { cb, session: session.clone(), io: Default::default() })),
+            (Some(cb), true) => Some(Arc::new(ClipboardCtx {
+                cb,
+                session: session.clone(),
+                io: Default::default(),
+                generation: AtomicU64::new(0),
+                readable: AtomicBool::new(false),
+            })),
             _ => None,
         };
         let fd = rd.connect_to_eis(&session, ConnectToEISOptions::default()).await?;
         let context = ei::Context::new(UnixStream::from(fd))?;
         let (connection, events) = context.handshake_tokio("kvmbridge", ei::handshake::ContextType::Sender).await?;
+        let handle = portal::handle_of(&*session);
         Ok(Remote {
             rd,
             session,
+            handle,
             clipboard,
             context,
             connection,
@@ -270,6 +302,7 @@ impl Remote {
         }
         let mut ready_sent = false;
         let mut geometry: Option<Desktop> = None;
+        let mut frontend_gone = portal::frontend_gone().await.ok();
 
         loop {
             tokio::select! {
@@ -302,7 +335,16 @@ impl Remote {
                 // Portals only deliver session signals to the session owner,
                 // and we own exactly one remote desktop session.
                 Some(change) = next_opt(&mut owner_changed) => {
+                    if let (Some(ctx), false) = (&cbctx, change.session_is_owner) {
+                        // Mutter dropped any paste request it waited on us for.
+                        ctx.generation.fetch_add(1, Ordering::SeqCst);
+                        ctx.readable.store(!change.mime_types.is_empty(), Ordering::SeqCst);
+                    }
                     if change.session_is_owner { continue; }
+                    if clip_state.last_change.as_ref().is_some_and(|(m, t)| *m == change.mime_types && t.elapsed() < DUPLICATE_WINDOW) {
+                        continue;
+                    }
+                    clip_state.last_change = Some((change.mime_types.clone(), Instant::now()));
                     let mimes = change.mime_types;
                     let mut formats: Vec<ClipFormat> = Vec::new();
                     for m in &mimes {
@@ -315,6 +357,13 @@ impl Remote {
                     if !formats.is_empty() {
                         let _ = clip.events.send(ClipboardEvent::LocalChanged { formats });
                     }
+                }
+                Some(()) = next_opt(&mut frontend_gone) => {
+                    // Our handle is dead now, but the session would live on.
+                    if let Some(h) = &self.handle {
+                        portal::close_at_backend(h, "remote desktop").await;
+                    }
+                    return Exit::Closed("the desktop portal went away".into());
                 }
                 Some((_session, mime, serial)) = next_opt(&mut transfers) => {
                     clip_state.transfer(mime, serial, &cbctx, clip);
@@ -580,13 +629,6 @@ impl Remote {
     }
 }
 
-async fn next_opt<S: futures::Stream + Unpin>(s: &mut Option<S>) -> Option<S::Item> {
-    match s {
-        Some(s) => s.next().await,
-        None => std::future::pending().await,
-    }
-}
-
 /// Clipboard bookkeeping.
 #[derive(Default)]
 struct ClipState {
@@ -596,6 +638,10 @@ struct ClipState {
     owner: u64,
     /// Offer currently advertised on behalf of a remote device.
     remote_offer: Option<u64>,
+    /// Mime types and time of our last SetSelection.
+    last_set: Option<(Vec<&'static str>, Instant)>,
+    /// The last clipboard change by another application.
+    last_change: Option<(Vec<String>, Instant)>,
 }
 
 impl ClipState {
@@ -610,7 +656,17 @@ impl ClipState {
             ClipboardCommand::AdvertiseRemote { offer, formats } => {
                 self.remote_offer = Some(offer);
                 let mimes: Vec<&'static str> = formats.iter().flat_map(|f| clipboard_mimes(*f).iter().copied()).collect();
+                // The same again right away (one copy reported twice): taking
+                // the clipboard again would drop pastes already under way.
+                if self.last_set.as_ref().is_some_and(|(m, t)| *m == mimes && t.elapsed() < DUPLICATE_WINDOW) {
+                    return;
+                }
+                self.last_set = Some((mimes.clone(), Instant::now()));
+                ctx.readable.store(false, Ordering::SeqCst);
                 tokio::spawn(async move {
+                    let _io = ctx.io.lock().await;
+                    // Requests from before this are dropped by mutter.
+                    ctx.generation.fetch_add(1, Ordering::SeqCst);
                     if let Err(e) = ctx.cb.set_selection(&ctx.session, SetSelectionOptions::default().set_mime_types(&mimes)).await {
                         tracing::warn!("cannot set clipboard: {e}");
                     }
@@ -637,6 +693,10 @@ impl ClipState {
                         }
                         match io.data.get(&mime) {
                             Some(d) => Some(d.clone()),
+                            None if !ctx.readable.load(Ordering::SeqCst) => {
+                                tracing::info!("the clipboard here is no longer another application's; not reading it");
+                                None
+                            }
                             None => {
                                 let d = read_selection(&ctx, &mime).await;
                                 if let Some(d) = d.as_ref().filter(|_| owner == io.owner) {
@@ -662,13 +722,20 @@ impl ClipState {
             });
             return;
         };
+        let generation = ctx.generation.load(Ordering::SeqCst);
+        let asked = Instant::now();
         let (tx, rx) = oneshot::channel();
         let _ = clip.events.send(ClipboardEvent::Paste { offer, format, reply: tx });
         tokio::spawn(async move {
-            let wait = if format == ClipFormat::Files { Duration::from_secs(3600) } else { Duration::from_secs(30) };
-            let data = tokio::time::timeout(wait, rx).await.ok().and_then(|r| r.ok()).flatten();
+            let data = tokio::time::timeout(PASTE_DEADLINE, rx).await.ok().and_then(|r| r.ok()).flatten();
             let _io = ctx.io.lock().await;
+            // Answering a request mutter has dropped brings the portal down.
+            let current = ctx.generation.load(Ordering::SeqCst) == generation && asked.elapsed() < PASTE_DEADLINE;
             let ok = match data {
+                Some(_) if !current => {
+                    tracing::info!("a paste request here was given up before its data arrived");
+                    false
+                }
                 Some(d) => {
                     let d = if format == ClipFormat::Files { encode_file_list(&mime, &d) } else { d };
                     match write_selection(&ctx, serial, &d).await {

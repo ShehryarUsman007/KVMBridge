@@ -5,11 +5,15 @@
 //! Both are arranged with invisible full-screen windows:
 //!
 //! * **Receiving** (`StartDrag`): a window is shown on the monitor under the
-//!   remote-controlled cursor and a button press is injected into it. That
-//!   press starts a native drag of the incoming files; the window then lets
-//!   input through, and a release injected a moment later drops the files on
-//!   the application under the cursor. When that application asks for the
-//!   data, we wait until the files have arrived and hand it their local paths.
+//!   remote-controlled cursor. Once it is fully on screen and the pointer is
+//!   over it (a small injected movement makes the compositor notice), a
+//!   button press is injected into it. That press starts a native drag of the
+//!   incoming files; the window then lets input through, and a release
+//!   injected a moment later drops the files on the application under the
+//!   cursor. When that application asks for the data, we wait until the
+//!   files have arrived and hand it their local paths. If the pointer never
+//!   gets over the window, nothing is pressed (the press would click whatever
+//!   is under the cursor instead).
 //! * **Sending** (`Probe`): when a button held while the cursor left this
 //!   screen is let go elsewhere, a drop target is shown under the (frozen)
 //!   local pointer. Mutter only moves a drag onto a new window when the
@@ -49,8 +53,9 @@ const PROBE_WAIT: Duration = Duration::from_millis(500);
 const MAP_WAIT: Duration = Duration::from_millis(2000);
 /// How long to look for a leftover local drag once the cursor is home.
 const SINK_WAIT: Duration = Duration::from_millis(800);
-/// How long to wait for the injected press that starts a drag.
-const PRESS_WAIT: Duration = Duration::from_millis(2000);
+/// How long to wait for the injected press that starts a drag (from showing
+/// the window).
+const PRESS_WAIT: Duration = Duration::from_millis(2500);
 
 type Events = UnboundedSender<DndEvent>;
 
@@ -100,7 +105,9 @@ fn overlay(pos: Option<Point>, index: Option<i32>) -> gtk::Window {
     win.set_skip_taskbar_hint(true);
     win.set_skip_pager_hint(true);
     win.set_app_paintable(true);
-    win.add_events(gdk::EventMask::BUTTON_PRESS_MASK | gdk::EventMask::BUTTON_RELEASE_MASK);
+    win.add_events(
+        gdk::EventMask::BUTTON_PRESS_MASK | gdk::EventMask::BUTTON_RELEASE_MASK | gdk::EventMask::ENTER_NOTIFY_MASK,
+    );
     if let Some(screen) = GtkWindowExt::screen(&win) {
         if let Some(v) = screen.rgba_visual() {
             win.set_visual(Some(&v));
@@ -332,6 +339,12 @@ struct DragState {
     id: u64,
     events: Events,
     started: bool,
+    /// The window is settled on screen; the press goes out once the pointer is over it.
+    settled: bool,
+    /// The pointer is over the window.
+    inside: bool,
+    /// A press was injected (a release must follow).
+    pressed: bool,
     failed: bool,
     ended: bool,
     ctx: Option<gdk::DragContext>,
@@ -368,6 +381,9 @@ fn start_drag(id: u64, names: Vec<String>, pos: Point, drop_after: Duration, eve
         id,
         events: events.clone(),
         started: false,
+        settled: false,
+        inside: false,
+        pressed: false,
         failed: false,
         ended: false,
         ctx: None,
@@ -427,27 +443,75 @@ fn start_drag(id: u64, names: Vec<String>, pos: Point, drop_after: Duration, eve
         });
     }
     {
-        let events = events.clone();
+        // Once it is fully on screen, a small movement makes the compositor
+        // put the pointer over it (enter-notify), and then the press goes out.
+        let st = st.clone();
         win.connect_map_event(move |_, _| {
-            let events = events.clone();
-            // Give the compositor a moment to put the window under the cursor.
-            glib::timeout_add_local_once(Duration::from_millis(80), move || {
-                let _ = events.send(DndEvent::InjectButton { pressed: true });
+            let st = st.clone();
+            glib::timeout_add_local_once(SETTLE, move || {
+                let (inside, events) = {
+                    let mut s = st.borrow_mut();
+                    s.settled = true;
+                    (s.inside, s.events.clone())
+                };
+                if inside {
+                    press_into(&st);
+                } else {
+                    let _ = events.send(DndEvent::InjectMove { dx: 1.0, dy: 0.0 });
+                    let _ = events.send(DndEvent::InjectMove { dx: -1.0, dy: 0.0 });
+                }
             });
             glib::Propagation::Proceed
         });
     }
     {
         let st = st.clone();
+        win.connect_enter_notify_event(move |_, _| {
+            st.borrow_mut().inside = true;
+            press_into(&st);
+            glib::Propagation::Proceed
+        });
+    }
+    {
+        let st = st.clone();
+        win.connect_leave_notify_event(move |_, _| {
+            st.borrow_mut().inside = false;
+            glib::Propagation::Proceed
+        });
+    }
+    {
+        let st = st.clone();
         glib::timeout_add_local_once(PRESS_WAIT, move || {
-            if !st.borrow().started {
-                tracing::warn!("no button press arrived to start the drag");
+            let (started, pressed, events) = {
+                let s = st.borrow();
+                (s.started, s.pressed, s.events.clone())
+            };
+            if !started {
+                if pressed {
+                    tracing::warn!("the injected press did not reach the drag window");
+                    let _ = events.send(DndEvent::InjectButton { pressed: false });
+                } else {
+                    tracing::warn!("the pointer did not get over the drag window; nothing was dropped");
+                }
                 end_drag(&st, false);
             }
         });
     }
     win.show_all();
     DRAG.with(|d| *d.borrow_mut() = Some(NativeDrag { id, win, st }));
+}
+
+/// Inject the press that starts the drag, once the window is settled and the
+/// pointer is over it (only once).
+fn press_into(st: &Rc<RefCell<DragState>>) {
+    let events = {
+        let mut s = st.borrow_mut();
+        if !s.settled || !s.inside || s.ended || std::mem::replace(&mut s.pressed, true) {
+            return;
+        }
+        s.events.clone()
+    };
+    let _ = events.send(DndEvent::InjectButton { pressed: true });
 }
 
 /// Drop the drag wherever the cursor is after `delay`: a small nudge makes the

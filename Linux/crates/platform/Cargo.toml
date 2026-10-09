@@ -12,6 +12,8 @@ tokio.workspace = true
 tracing.workspace = true
 futures.workspace = true
 parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ashpd = { version = "0.13", default-features = false, features = ["tokio", "input_capture", "remote_desktop", "screencast", "clipboard"] }

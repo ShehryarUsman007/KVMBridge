@@ -4,7 +4,11 @@ import { useEngine } from "../store";
 import { IconRefresh } from "../components/Icons";
 
 const BACKENDS: { key: "capture" | "emulation" | "clipboard" | "dnd"; label: string; what: string }[] = [
-  { key: "capture", label: "Input capture", what: "Lets this computer's keyboard and mouse control other screens." },
+  {
+    key: "capture",
+    label: "Input capture",
+    what: "Lets this computer's keyboard and mouse control other screens. If they ever stop responding here, press Super+Shift+Esc to get them back.",
+  },
   { key: "emulation", label: "Input control", what: "Lets other computers move this cursor and type here." },
   { key: "clipboard", label: "Clipboard", what: "Shares copied text, images and files." },
   { key: "dnd", label: "Drag and drop", what: "Drags files across screens." },

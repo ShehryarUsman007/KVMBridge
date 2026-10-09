@@ -4,6 +4,7 @@
 
 mod capture;
 pub mod guard;
+mod portal;
 mod remote;
 pub mod selection;
 

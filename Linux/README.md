@@ -67,7 +67,9 @@ If you dismiss one, open **Status** and click **Retry permissions**.
 To take the keyboard and mouse back from KVM Bridge at any time, press
 `Ctrl+Alt+Shift+Esc`. GNOME's own shortcut for ending input capture,
 `Super+Shift+Esc`, works too, but it switches input capture off until you
-click **Retry** on **Status**.
+click **Retry** on **Status**. If this computer's keyboard and mouse ever stop
+responding altogether, `Super+Shift+Esc` is the one to press: GNOME handles it
+itself, even when KVM Bridge cannot.
 
 While another computer has the cursor, the screen you left keeps showing the
 pointer where it crossed: GNOME holds it there and does not let applications
