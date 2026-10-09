@@ -15,6 +15,13 @@
 //!   event, the power key included, until it is released. If releasing ever
 //!   fails, or the portal frontend went away (see [`super::portal`]), the
 //!   session is closed at the portal backend directly and set up again.
+//! * `Activated` and `Deactivated` arrive on separate signal streams. After a
+//!   release GNOME may capture again at once (the pointer still pushes
+//!   against the edge), and the old activation's `Deactivated` can then be
+//!   handled after the new `Activated`: only the activation it names ends.
+//!   libei tells when input is really held (its devices start and stop
+//!   emulating); input held with no activation to release it under is given
+//!   back anyway, and if that does not work the session is closed.
 
 use ashpd::desktop::input_capture::{
     ActivatedBarrier, Barrier, Capabilities, ConnectToEISOptions, CreateSessionOptions,
@@ -29,7 +36,7 @@ use kvmbridge_core::platform::{BackendSide, BackendStatus, CaptureCommand, Captu
 use kvmbridge_core::types::{Edge, Rect};
 use reis::ei;
 use reis::event::{DeviceCapability, EiEvent};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU32;
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
@@ -38,6 +45,10 @@ use tokio::time::Instant;
 /// How long the screen arrangement must stay unchanged before a new session
 /// (and with it a permission dialog) is started for it.
 const RESTART_DELAY: Duration = Duration::from_millis(1500);
+/// How long libei may report input held with no activation we know of
+/// before it counts as stuck (the `Activated` signal normally comes within
+/// milliseconds).
+const STRAY_WAIT: Duration = Duration::from_millis(1000);
 
 type Side = BackendSide<CaptureCommand, CaptureEvent>;
 
@@ -129,6 +140,16 @@ struct Capture {
     enabled: bool,
     ei: Option<EiConn>,
     activation: Option<u32>,
+    /// The latest activation GNOME announced (kept after it ended, to give
+    /// back input that is somehow still held).
+    last_activation: Option<u32>,
+    /// libei devices GNOME sends captured input through right now: not empty
+    /// exactly while input is held.
+    emulating: HashSet<reis::event::Device>,
+    /// Input has been held without an activation we know of since then, and
+    /// whether giving it back was already tried.
+    stray_since: Option<Instant>,
+    stray_tried: bool,
     /// Edges that currently lead to another screen (a subset of the barriers).
     live: Vec<Edge>,
     /// A new session is needed for the wanted edges; started at this time.
@@ -163,6 +184,10 @@ impl Capture {
             enabled: false,
             ei: None,
             activation: None,
+            last_activation: None,
+            emulating: HashSet::new(),
+            stray_since: None,
+            stray_tried: false,
             live: vec![],
             restart_at: None,
             guard,
@@ -255,7 +280,14 @@ impl Capture {
     /// which case mutter may be holding all input with nobody to release it.
     async fn release(&mut self, pos: Option<(f64, f64)>) -> bool {
         let Some(act) = self.activation.take() else { return true };
-        let mut opts = ReleaseOptions::default().set_activation_id(act);
+        self.release_as(Some(act), pos).await
+    }
+
+    async fn release_as(&mut self, act: Option<u32>, pos: Option<(f64, f64)>) -> bool {
+        let mut opts = ReleaseOptions::default();
+        if let Some(a) = act {
+            opts = opts.set_activation_id(a);
+        }
         if let Some(p) = pos {
             opts = opts.set_cursor_position(p);
         }
@@ -267,6 +299,30 @@ impl Capture {
                 tracing::warn!("giving input back failed: {e}");
                 false
             }
+        }
+    }
+
+    /// Make sure input is not held: release the activation we hold, or input
+    /// that libei says is held without one. Returns false if that failed.
+    async fn give_back(&mut self, side: &Side) -> bool {
+        if self.activation.is_some() {
+            let _ = side.events.send(CaptureEvent::Deactivated);
+            return self.release(None).await;
+        }
+        if self.emulating.is_empty() {
+            return true;
+        }
+        tracing::warn!("input is held with no activation to give it back under; giving it back anyway");
+        self.release_as(self.last_activation, None).await
+    }
+
+    /// Keep track of input held with no activation we know of.
+    fn check_stray(&mut self) {
+        if !self.emulating.is_empty() && self.activation.is_none() {
+            self.stray_since.get_or_insert_with(Instant::now);
+        } else {
+            self.stray_since = None;
+            self.stray_tried = false;
         }
     }
 
@@ -310,8 +366,20 @@ impl Capture {
         }
 
         loop {
+            self.check_stray();
             let restart_at = self.restart_at;
+            let stray_at = self.stray_since.map(|t| t + STRAY_WAIT);
             tokio::select! {
+                _ = tokio::time::sleep_until(stray_at.unwrap_or_else(Instant::now)), if stray_at.is_some() => {
+                    if self.stray_tried {
+                        return self.orphaned("input is still held after giving it back").await;
+                    }
+                    self.stray_tried = true;
+                    self.stray_since = Some(Instant::now());
+                    if !self.give_back(side).await {
+                        return self.orphaned("input could not be given back").await;
+                    }
+                }
                 _ = tokio::time::sleep_until(restart_at.unwrap_or_else(Instant::now)), if restart_at.is_some() => {
                     if self.activation.is_none() {
                         return Exit::Restart;
@@ -335,7 +403,13 @@ impl Capture {
                             return self.orphaned("input could not be given back").await;
                         }
                     }
-                    Some(CaptureCommand::Enable(_)) => {}
+                    Some(CaptureCommand::Enable(on)) => {
+                        // Switched off, or controlled from another computer:
+                        // input must be free here, whatever happened before.
+                        if !on && !self.give_back(side).await {
+                            return self.orphaned("input could not be given back").await;
+                        }
+                    }
                     Some(CaptureCommand::Restart) => return Exit::Restart,
                     Some(CaptureCommand::BlockLocalInput(b)) => self.guard.set(b),
                 },
@@ -347,6 +421,7 @@ impl Capture {
                     };
                     let pos = a.cursor_position().map(|(x, y)| kvmbridge_core::types::Point::new(x as f64, y as f64));
                     self.activation = Some(id);
+                    self.last_activation = Some(id);
                     match (edge, pos) {
                         (Some(edge), Some(pos)) if !self.live.contains(&edge) => {
                             // An edge that led somewhere earlier in this session.
@@ -365,8 +440,11 @@ impl Capture {
                         }
                     }
                 }
-                Some(_d) = deactivated.next() => {
-                    if self.activation.take().is_some() {
+                Some(d) = deactivated.next() => {
+                    // Only the activation it names ends (a newer one may
+                    // already have started).
+                    let ours = d.activation_id().is_none_or(|id| self.activation == Some(id));
+                    if ours && self.activation.take().is_some() {
                         let _ = side.events.send(CaptureEvent::Deactivated);
                     }
                 }
@@ -422,6 +500,17 @@ impl Capture {
                 if let Some(c) = &self.ei {
                     let _ = c.context.flush();
                 }
+            }
+            EiEvent::DeviceStartEmulating(e) => {
+                tracing::debug!("captured input starts ({:?})", e.device);
+                self.emulating.insert(e.device);
+            }
+            EiEvent::DeviceStopEmulating(e) => {
+                tracing::debug!("captured input stops ({:?})", e.device);
+                self.emulating.remove(&e.device);
+            }
+            EiEvent::DeviceRemoved(d) => {
+                self.emulating.remove(&d.device);
             }
             // Only forward input while we hold an activation.
             _ if self.activation.is_none() => {}
