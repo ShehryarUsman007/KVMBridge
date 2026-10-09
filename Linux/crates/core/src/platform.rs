@@ -188,7 +188,13 @@ pub enum DndCommand {
     /// Start a native drag of not-yet-received files under the (remote
     /// controlled) cursor at `pos`, and drop it wherever the cursor is
     /// `drop_after_ms` later.
-    StartDrag { drag: u64, names: Vec<String>, pos: Point, drop_after_ms: u64 },
+    ///
+    /// `after_release`: the cursor came back to this screen with the button
+    /// still held (the files come from the screen it left), so the drag
+    /// starts only once that button is let go here, where it was let go. The
+    /// files may not be known yet (`names` empty); [`DndCommand::CancelDrag`]
+    /// follows if nothing was being dragged.
+    StartDrag { drag: u64, names: Vec<String>, pos: Point, drop_after_ms: u64, after_release: bool },
     CancelDrag { drag: u64 },
 }
 

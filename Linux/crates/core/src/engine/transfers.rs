@@ -359,7 +359,7 @@ impl Engine {
             TransferPurpose::Manual => self.notice(notice),
             TransferPurpose::Drag { drag } => {
                 if !outgoing {
-                    self.dnd_transfer_done(drag, result.as_ref().map_err(Clone::clone));
+                    self.dnd_transfer_done(peer, drag, result.as_ref().map_err(Clone::clone));
                 }
                 if result.is_err() {
                     self.notice(notice);

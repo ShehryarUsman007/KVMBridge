@@ -13,6 +13,15 @@
 //! copies: the files arrive in a holding folder the application copies them
 //! from, and the originals stay where they are. Like any drop on that
 //! computer, if nothing under the cursor takes the files, nothing happens.
+//!
+//! The other way round, a drag that starts on a controlled screen and comes
+//! back here: when the cursor leaves the controlled screen with the button
+//! held, that computer reads its drag the same way (a probe window and a
+//! moved pointer, no capture needed there), cancels it with Escape and sends
+//! the files here, or says that nothing was being dragged. Here the drag is
+//! "carried": the button is still held, so the native drag starts only once
+//! it is let go (see [`DndCommand::StartDrag`]'s `after_release`), and drops
+//! where it was let go.
 
 use super::*;
 use crate::platform::ProbeOutcome;
@@ -30,6 +39,8 @@ const NUDGE_AFTER: [u64; 2] = [80, 250];
 /// the probe window only covers the work area, without the docks and panels
 /// along the edges.
 const PROBE_INSET: f64 = 0.25;
+/// Longest time a controlled computer spends reading a drag that leaves it.
+const LEAVE_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Default)]
 pub(crate) struct DndState {
@@ -42,6 +53,28 @@ pub(crate) struct DndState {
     incoming: HashMap<u64, InDrag>,
     /// Input capture is let go for the probe.
     handoff: Option<Handoff>,
+    /// Controlled side: the cursor left with the button held, and the drag
+    /// here (if any) is being read before input is let go.
+    leaving: Option<Leaving>,
+    /// Controller side: the cursor came home with the button held, and a
+    /// drag from the screen it left may follow.
+    carry: Option<Carry>,
+    /// A carried drag from this computer ended before it was announced: its
+    /// announcement is refused when it comes.
+    carry_refused: Option<DeviceId>,
+}
+
+struct Leaving {
+    probe: u64,
+    /// The computer that was controlling this one (where the files go).
+    peer: DeviceId,
+    deadline: Instant,
+}
+
+struct Carry {
+    /// Our id for the native drag here.
+    drag: u64,
+    peer: DeviceId,
 }
 
 struct Handoff {
@@ -67,6 +100,9 @@ struct InDrag {
     reply: Option<oneshot::Sender<Option<Vec<PathBuf>>>>,
     /// The native drag finished (the entry only lives on to deliver data).
     ended: bool,
+    /// The sender's id for this drag (`None` while a carried drag has not
+    /// been announced yet).
+    remote: Option<u64>,
 }
 
 impl Engine {
@@ -81,6 +117,8 @@ impl Engine {
         if let Some(old) = self.dnd.probe.take() {
             self.dnd.held_outcome = Some((old, ProbeOutcome::Abandoned));
         }
+        // A drag carried here goes back with the cursor.
+        self.cancel_carry();
     }
 
     /// `button` was held while the cursor left this screen and has just been
@@ -108,7 +146,16 @@ impl Engine {
                 self.broadcast_caps();
                 self.mark_dirty();
             }
-            DndEvent::ProbeReady { probe } => self.release_for_probe(probe),
+            DndEvent::ProbeReady { probe } => {
+                if self.dnd.leaving.as_ref().is_some_and(|l| l.probe == probe) {
+                    self.leaving_probe_ready(probe);
+                } else {
+                    self.release_for_probe(probe);
+                }
+            }
+            DndEvent::Probed { probe, paths, .. } if self.dnd.leaving.as_ref().is_some_and(|l| l.probe == probe) => {
+                self.finish_leaving(paths);
+            }
             DndEvent::Probed { probe, paths, dragging } => {
                 if self.dnd.probe != Some(probe) {
                     return;
@@ -160,7 +207,7 @@ impl Engine {
                     return;
                 }
                 d.ended = true;
-                let (peer, transfer) = (d.peer, d.transfer);
+                let (peer, transfer, remote) = (d.peer, d.transfer, d.remote);
                 tracing::info!("remote drag {drag:x} ended (accepted: {accepted})");
                 if peer == self.me() {
                     // The diagnostics test drag.
@@ -169,7 +216,19 @@ impl Engine {
                     self.dnd.incoming.remove(&drag);
                     return;
                 }
-                self.send_to(peer, Msg::DragFinished { drag, accepted });
+                if self.dnd.carry.as_ref().is_some_and(|c| c.drag == drag) {
+                    self.dnd.carry = None;
+                    if remote.is_none() {
+                        // Not announced yet: refused as soon as it is.
+                        tracing::info!("the carried drag ended before its files were known");
+                        self.dnd.incoming.remove(&drag);
+                        self.dnd.carry_refused = Some(peer);
+                        return;
+                    }
+                }
+                if let Some(r) = remote {
+                    self.send_to(peer, Msg::DragFinished { drag: r, accepted });
+                }
                 if !accepted {
                     // Nothing under the cursor took the files.
                     if let Some(t) = transfer {
@@ -267,6 +326,11 @@ impl Engine {
     /// a motion to report it. Move one pixel along the edge and back (never
     /// towards it, which would capture input again).
     pub(crate) fn nudge_handoff(&mut self, probe: u64) {
+        if self.dnd.leaving.as_ref().is_some_and(|l| l.probe == probe) {
+            let _ = self.emu.send(EmulationCommand::MoveRel { dx: 0.0, dy: 1.0 });
+            let _ = self.emu.send(EmulationCommand::MoveRel { dx: 0.0, dy: -1.0 });
+            return;
+        }
         let Some(h) = self.dnd.handoff.as_mut().filter(|h| h.probe == probe) else { return };
         if !matches!(self.input, Input::Controlling(_)) || self.dnd.probe != Some(probe) {
             return;
@@ -315,6 +379,10 @@ impl Engine {
     /// Input was not captured again in time (the pointer moved away on this
     /// screen meanwhile): the cursor stays here.
     pub(crate) fn tick_dnd(&mut self, now: Instant) {
+        if self.dnd.leaving.as_ref().is_some_and(|l| now >= l.deadline) {
+            tracing::info!("the drag leaving this screen could not be read in time");
+            self.finish_leaving(vec![]);
+        }
         if self.dnd.handoff.as_ref().is_none_or(|h| now < h.deadline) {
             return;
         }
@@ -359,7 +427,7 @@ impl Engine {
         let drag = crate::crypto::random_u64();
         self.dnd.incoming.insert(
             drag,
-            InDrag { peer: self.me(), transfer: None, result: Some(Ok(vec![file])), reply: None, ended: false },
+            InDrag { peer: self.me(), transfer: None, result: Some(Ok(vec![file])), reply: None, ended: false, remote: None },
         );
         let desk = self.local_desktop();
         let b = desk.bounds();
@@ -369,6 +437,7 @@ impl Engine {
             names: vec!["KVM Bridge test.txt".into()],
             pos,
             drop_after_ms: seconds * 1000,
+            after_release: false,
         });
         Ok(())
     }
@@ -389,6 +458,28 @@ impl Engine {
     // ------------------------------------------------------------ target side
 
     pub(crate) fn on_drag_begin(&mut self, peer: DeviceId, drag: u64, _transfer: u64, items: Vec<ItemMeta>) {
+        if self.dnd.carry_refused == Some(peer) {
+            // The carried drag already ended here.
+            self.dnd.carry_refused = None;
+            if !items.is_empty() {
+                self.send_to(peer, Msg::DragFinished { drag, accepted: false });
+            }
+            return;
+        }
+        if let Some(c) = self.dnd.carry.as_ref().filter(|c| c.peer == peer) {
+            let local = c.drag;
+            if items.is_empty() {
+                // Nothing was being dragged over there.
+                tracing::info!("nothing was being dragged on {}", self.peer_label(peer));
+                self.cancel_carry();
+                return;
+            }
+            tracing::info!("{} item(s) are being dragged here from {}", items.len(), self.peer_label(peer));
+            if let Some(d) = self.dnd.incoming.get_mut(&local) {
+                d.remote = Some(drag);
+            }
+            return;
+        }
         let controlled_by_peer = self.controlled.as_ref().is_some_and(|c| c.peer == peer);
         if !controlled_by_peer || !self.dnd_enabled() {
             self.send_to(peer, Msg::DragFinished { drag, accepted: false });
@@ -396,17 +487,113 @@ impl Engine {
         }
         let pos = self.controlled_pos().unwrap_or_default();
         let names = items.into_iter().map(|i| i.rel_path).collect();
-        self.dnd.incoming.insert(drag, InDrag { peer, transfer: None, result: None, reply: None, ended: false });
+        self.dnd.incoming.insert(drag, InDrag { peer, transfer: None, result: None, reply: None, ended: false, remote: Some(drag) });
         // The user already let go on the controller: drop as soon as the
         // application under the cursor has seen the drag.
-        let _ = self.dndcmd.send(DndCommand::StartDrag { drag, names, pos, drop_after_ms: 250 });
+        let _ = self.dndcmd.send(DndCommand::StartDrag { drag, names, pos, drop_after_ms: 250, after_release: false });
+    }
+
+    // ------------------------------------------------- drags coming home
+
+    /// The cursor came home from `peer` with the left button held: files
+    /// dragged there may follow. A native drag waits here for the release.
+    pub(crate) fn begin_carry(&mut self, peer: DeviceId) {
+        if !self.dnd_enabled() {
+            return;
+        }
+        self.cancel_carry();
+        self.dnd.carry_refused = None;
+        let drag = crate::crypto::random_u64();
+        tracing::info!("the cursor came back from {} with the button held; waiting for it to be let go", self.peer_label(peer));
+        self.dnd.incoming.insert(drag, InDrag { peer, transfer: None, result: None, reply: None, ended: false, remote: None });
+        self.dnd.carry = Some(Carry { drag, peer });
+        let pos = self.local_desktop().center();
+        let _ = self.dndcmd.send(DndCommand::StartDrag { drag, names: vec![], pos, drop_after_ms: 250, after_release: true });
+    }
+
+    /// Give up on a carried drag (nothing came, or the cursor left again).
+    fn cancel_carry(&mut self) {
+        let Some(c) = self.dnd.carry.take() else { return };
+        if let Some(d) = self.dnd.incoming.remove(&c.drag) {
+            if let Some(r) = d.reply {
+                let _ = r.send(None);
+            }
+            if let Some(remote) = d.remote {
+                self.send_to(d.peer, Msg::DragFinished { drag: remote, accepted: false });
+                if let Some(t) = d.transfer {
+                    let _ = self.cancel_transfer(t, true);
+                }
+            } else {
+                self.dnd.carry_refused = Some(d.peer);
+            }
+        }
+        let _ = self.dndcmd.send(DndCommand::CancelDrag { drag: c.drag });
+    }
+
+    /// Controlled side: the cursor left this screen with the left button
+    /// held. Returns true if the drag here is read first (the caller then
+    /// leaves input as it is; [`Self::finish_leaving`] lets go of it).
+    pub(crate) fn leave_with_drag(&mut self, peer: DeviceId) -> bool {
+        if !self.dnd_enabled() || self.dnd.leaving.is_some() {
+            return false;
+        }
+        let probe = crate::crypto::random_u64();
+        tracing::info!("the cursor left with the button held; checking for a file drag here");
+        self.dnd.leaving = Some(Leaving { probe, peer, deadline: Instant::now() + LEAVE_PROBE_TIMEOUT });
+        let pos = self.local_desktop().center();
+        let _ = self.dndcmd.send(DndCommand::Probe { probe, pos });
+        true
+    }
+
+    /// The probe window is up: move the pointer (still holding the button)
+    /// into it, then wiggle it so the drag shows up there.
+    fn leaving_probe_ready(&mut self, probe: u64) {
+        let center = self.local_desktop().center();
+        let _ = self.emu.send(EmulationCommand::MoveAbs { pos: center });
+        let internal = self.internal.clone();
+        tokio::spawn(async move {
+            for (i, ms) in NUDGE_AFTER.iter().enumerate() {
+                let since = if i == 0 { *ms } else { ms - NUDGE_AFTER[i - 1] };
+                tokio::time::sleep(Duration::from_millis(since)).await;
+                if internal.send(Internal::HandoffNudge { probe }).is_err() {
+                    return;
+                }
+            }
+        });
+    }
+
+    /// The drag leaving this screen was read (or not): cancel it with Escape,
+    /// let go of the button, tuck the pointer away and tell the controller.
+    fn finish_leaving(&mut self, paths: Vec<PathBuf>) {
+        let Some(l) = self.dnd.leaving.take() else { return };
+        let _ = self.dndcmd.send(DndCommand::ProbeDone { probe: l.probe, outcome: ProbeOutcome::Cancelled });
+        let park = self.local_desktop().park_point();
+        let _ = self.emu.send(EmulationCommand::Leave { park: Some(park) });
+        self.update_edges();
+        self.mark_dirty();
+        if paths.is_empty() {
+            tracing::info!("no files were being dragged off this screen");
+            // An empty drag tells the controller that nothing is coming.
+            self.send_to(l.peer, Msg::DragBegin { drag: crate::crypto::random_u64(), transfer: 0, items: vec![] });
+            return;
+        }
+        tracing::info!("dragging {} item(s) to {}", paths.len(), self.peer_label(l.peer));
+        self.begin_out_drag(l.peer, paths);
+    }
+
+    /// Controlled side: the cursor came back while a leaving drag was being
+    /// read. The drag just carries on here.
+    pub(crate) fn abandon_leaving(&mut self) {
+        if let Some(l) = self.dnd.leaving.take() {
+            let _ = self.dndcmd.send(DndCommand::ProbeDone { probe: l.probe, outcome: ProbeOutcome::Cancelled });
+        }
     }
 
     /// The files of `drag` are offered. Returns false if that drag is not
     /// going on here (it was refused or is over), so they are declined.
     pub(crate) fn dnd_transfer_offered(&mut self, peer: DeviceId, drag: u64, local_transfer: u64) -> bool {
-        match self.dnd.incoming.get_mut(&drag) {
-            Some(d) if d.peer == peer && d.transfer.is_none() => {
+        match self.dnd.incoming.values_mut().find(|d| d.peer == peer && d.remote == Some(drag)) {
+            Some(d) if d.transfer.is_none() => {
                 d.transfer = Some(local_transfer);
                 true
             }
@@ -414,7 +601,13 @@ impl Engine {
         }
     }
 
-    pub(crate) fn dnd_transfer_done(&mut self, drag: u64, result: Result<&Received, String>) {
+    /// Our id for the sender's drag `remote`.
+    fn local_drag(&self, peer: DeviceId, remote: u64) -> Option<u64> {
+        self.dnd.incoming.iter().find(|(_, d)| d.peer == peer && d.remote == Some(remote)).map(|(k, _)| *k)
+    }
+
+    pub(crate) fn dnd_transfer_done(&mut self, peer: DeviceId, remote: u64, result: Result<&Received, String>) {
+        let Some(drag) = self.local_drag(peer, remote) else { return };
         let Some(d) = self.dnd.incoming.get_mut(&drag) else { return };
         let r = match result {
             Ok(Received::Files(p)) => Ok(p.clone()),
@@ -436,12 +629,12 @@ impl Engine {
         }
     }
 
-    pub(crate) fn on_drag_cancel(&mut self, peer: DeviceId, drag: u64) {
+    pub(crate) fn on_drag_cancel(&mut self, peer: DeviceId, remote: u64) {
+        let Some(drag) = self.local_drag(peer, remote) else { return };
+        if self.dnd.carry.as_ref().is_some_and(|c| c.drag == drag) {
+            self.dnd.carry = None;
+        }
         if let Some(d) = self.dnd.incoming.remove(&drag) {
-            if d.peer != peer {
-                self.dnd.incoming.insert(drag, d);
-                return;
-            }
             if let Some(r) = d.reply {
                 let _ = r.send(None);
             }
@@ -456,6 +649,7 @@ impl Engine {
     }
 
     pub(crate) fn dnd_controller_changed(&mut self) {
+        self.dnd.carry = None;
         let drags: Vec<u64> = self.dnd.incoming.keys().copied().collect();
         for drag in drags {
             if let Some(d) = self.dnd.incoming.remove(&drag) {
@@ -468,6 +662,12 @@ impl Engine {
     }
 
     pub(crate) fn dnd_peer_gone(&mut self, peer: DeviceId) {
+        if self.dnd.carry.as_ref().is_some_and(|c| c.peer == peer) {
+            self.dnd.carry = None;
+        }
+        if self.dnd.leaving.as_ref().is_some_and(|l| l.peer == peer) {
+            self.finish_leaving(vec![]);
+        }
         let drags: Vec<u64> = self.dnd.incoming.iter().filter(|(_, d)| d.peer == peer).map(|(k, _)| *k).collect();
         for drag in drags {
             if let Some(d) = self.dnd.incoming.remove(&drag) {

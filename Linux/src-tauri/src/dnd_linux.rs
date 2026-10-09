@@ -21,6 +21,19 @@
 //!   whatever is under the cursor instead). An injected press is always
 //!   released again, however the drag ends: while it is held, GNOME ignores
 //!   every other click of that button, the touchpad's included.
+//!   A drag *carried* back to this screen (`after_release`) arrives with the
+//!   real button still held, which GNOME never saw pressed (input was
+//!   captured), so the drag cannot start yet and we are not told when the
+//!   button is let go. GNOME drops a press of a button that is already held,
+//!   though: while the pointer is over the window, a press is injected now
+//!   and then, and released again if it did not arrive. The first one that
+//!   arrives means the button was let go right there, and it starts the
+//!   drag, which then drops as above. GNOME may also keep the pointer on
+//!   whatever it was over while the button is held, so the window only sees
+//!   the pointer once it is let go: then the press arrives at once, which
+//!   counts as "let go here" if the pointer came in well inside the window,
+//!   and as "let go elsewhere" (over a panel or dock beside it, so nothing is
+//!   dropped) if it came in over an edge.
 //! * **Sending** (`Probe`): when a button held while the cursor left this
 //!   screen is let go elsewhere, a drop target is shown. Mutter only moves a
 //!   drag onto a new window when the pointer moves, so once it is mapped
@@ -64,6 +77,17 @@ const SINK_WAIT: Duration = Duration::from_millis(800);
 /// How long to wait for the injected press that starts a drag (from showing
 /// the window).
 const PRESS_WAIT: Duration = Duration::from_millis(2500);
+/// Carried drags: how long an injected press may take to arrive before it
+/// counts as dropped (the button is still held), the pause before the next
+/// one, how recently the button must have been seen held for an arriving
+/// press to mean "let go here", and how long to wait for that at most.
+const CARRY_CHECK: Duration = Duration::from_millis(150);
+const CARRY_GAP: Duration = Duration::from_millis(50);
+const CARRY_HELD_RECENTLY: Duration = Duration::from_millis(600);
+const CARRY_WAIT: Duration = Duration::from_secs(30);
+/// Carried drags: a pointer that comes in this close to the window's edge
+/// came from a panel or dock beside it.
+const CARRY_EDGE: f64 = 24.0;
 /// While dropping, how often to check whether an application takes the drag
 /// (nudging the pointer while none does), and for how long before letting go
 /// anyway.
@@ -103,8 +127,8 @@ fn on_command(cmd: DndCommand, events: Events) {
     match cmd {
         DndCommand::Probe { probe, .. } => start_probe(probe, events),
         DndCommand::ProbeDone { probe, outcome } => finish_probe(probe, outcome, events),
-        DndCommand::StartDrag { drag, names, drop_after_ms, .. } => {
-            start_drag(drag, names, Duration::from_millis(drop_after_ms), events)
+        DndCommand::StartDrag { drag, names, drop_after_ms, after_release, .. } => {
+            start_drag(drag, names, Duration::from_millis(drop_after_ms), after_release, events)
         }
         DndCommand::CancelDrag { drag } => cancel_drag(drag),
     }
@@ -361,8 +385,21 @@ struct DragState {
     settled: bool,
     /// The pointer is over the window.
     inside: bool,
-    /// A press was injected (a release must follow).
+    /// The press that starts the drag went out (it is injected once, unless
+    /// the drag is carried).
+    tried: bool,
+    /// An injected press is held (a release must follow).
     pressed: bool,
+    /// A carried drag: it starts once the real button is let go.
+    carried: bool,
+    /// Carried: an injected press is on its way.
+    trying: bool,
+    /// Carried: when an injected press last did not arrive (the button was
+    /// still held then).
+    held_at: Option<std::time::Instant>,
+    /// Carried: the pointer last came in well inside the window (not over an
+    /// edge).
+    entered_deep: bool,
     /// The application under the pointer takes the drag.
     taken: bool,
     released: bool,
@@ -393,14 +430,9 @@ fn end_drag(st: &Rc<RefCell<DragState>>, accepted: bool) {
     glib::idle_add_local_once(move || close_drag(id));
 }
 
-fn start_drag(id: u64, names: Vec<String>, drop_after: Duration, events: Events) {
+fn start_drag(id: u64, names: Vec<String>, drop_after: Duration, carried: bool, events: Events) {
     if let Some(old) = DRAG.with(|d| d.borrow_mut().take()) {
-        let ctx = old.st.borrow().ctx.clone();
-        if let Some(ctx) = ctx {
-            ctx.drag_cancel();
-        }
-        let_go(&old.st);
-        old.win.close();
+        stop_drag(&old);
     }
     let st = Rc::new(RefCell::new(DragState {
         id,
@@ -408,7 +440,12 @@ fn start_drag(id: u64, names: Vec<String>, drop_after: Duration, events: Events)
         started: false,
         settled: false,
         inside: false,
+        tried: false,
         pressed: false,
+        carried,
+        trying: false,
+        held_at: None,
+        entered_deep: false,
         taken: false,
         released: false,
         failed: false,
@@ -422,9 +459,27 @@ fn start_drag(id: u64, names: Vec<String>, drop_after: Duration, events: Events)
     {
         let st = st.clone();
         win.connect_button_press_event(move |w, ev| {
-            if ev.button() != 1 || std::mem::replace(&mut st.borrow_mut().started, true) {
+            if ev.button() != 1 || st.borrow().started {
                 return glib::Propagation::Proceed;
             }
+            let (carried, pressed, let_go_here) = {
+                let s = st.borrow();
+                let held_recently = s.held_at.is_some_and(|t| t.elapsed() <= CARRY_HELD_RECENTLY);
+                (s.carried, s.pressed, held_recently || s.entered_deep)
+            };
+            if carried && !pressed {
+                // Not our press (or one we already gave up on).
+                return glib::Propagation::Proceed;
+            }
+            if carried && !let_go_here {
+                // The button was let go somewhere else (over a panel or
+                // dock) and the pointer came here later: drop nothing.
+                tracing::info!("the button was let go elsewhere; nothing is dropped");
+                let_go(&st);
+                end_drag(&st, false);
+                return glib::Propagation::Stop;
+            }
+            st.borrow_mut().started = true;
             // A URI list, plus the file-transfer portal's types when it is
             // there, so sandboxed (Flatpak) applications can read the files.
             let targets = gtk::TargetList::new(&[]);
@@ -502,7 +557,7 @@ fn start_drag(id: u64, names: Vec<String>, drop_after: Duration, events: Events)
                 };
                 if inside {
                     press_into(&st);
-                } else {
+                } else if !st.borrow().carried {
                     let _ = events.send(DndEvent::InjectMove { dx: 1.0, dy: 0.0 });
                     let _ = events.send(DndEvent::InjectMove { dx: -1.0, dy: 0.0 });
                 }
@@ -512,8 +567,15 @@ fn start_drag(id: u64, names: Vec<String>, drop_after: Duration, events: Events)
     }
     {
         let st = st.clone();
-        win.connect_enter_notify_event(move |_, _| {
-            st.borrow_mut().inside = true;
+        win.connect_enter_notify_event(move |w, ev| {
+            let (x, y) = ev.position();
+            let a = w.allocation();
+            let (wd, ht) = (f64::from(a.width()), f64::from(a.height()));
+            {
+                let mut s = st.borrow_mut();
+                s.inside = true;
+                s.entered_deep = (CARRY_EDGE..=wd - CARRY_EDGE).contains(&x) && (CARRY_EDGE..=ht - CARRY_EDGE).contains(&y);
+            }
             press_into(&st);
             glib::Propagation::Proceed
         });
@@ -527,12 +589,13 @@ fn start_drag(id: u64, names: Vec<String>, drop_after: Duration, events: Events)
     }
     {
         let st = st.clone();
-        glib::timeout_add_local_once(PRESS_WAIT, move || {
-            let (started, pressed) = {
+        let wait = if st.borrow().carried { CARRY_WAIT } else { PRESS_WAIT };
+        glib::timeout_add_local_once(wait, move || {
+            let (started, pressed, ended) = {
                 let s = st.borrow();
-                (s.started, s.pressed)
+                (s.started, s.pressed, s.ended)
             };
-            if !started {
+            if !started && !ended {
                 if pressed {
                     tracing::warn!("the injected press did not reach the drag window");
                     let_go(&st);
@@ -543,21 +606,77 @@ fn start_drag(id: u64, names: Vec<String>, drop_after: Duration, events: Events)
             }
         });
     }
+    if carried {
+        // Show that something is being dragged while the button is held.
+        win.connect_realize(|w| {
+            if let (Some(gw), Some(d)) = (w.window(), gdk::Display::default()) {
+                gw.set_cursor(gdk::Cursor::from_name(&d, "copy").as_ref());
+            }
+        });
+    }
     win.show_all();
     DRAG.with(|d| *d.borrow_mut() = Some(NativeDrag { id, win, st }));
 }
 
 /// Inject the press that starts the drag, once the window is settled and the
-/// pointer is over it (only once).
+/// pointer is over it (only once, or for a carried drag, again and again
+/// until one arrives).
 fn press_into(st: &Rc<RefCell<DragState>>) {
+    if st.borrow().carried {
+        carry_try(st);
+        return;
+    }
     let events = {
         let mut s = st.borrow_mut();
-        if !s.settled || !s.inside || s.ended || std::mem::replace(&mut s.pressed, true) {
+        if !s.settled || !s.inside || s.ended || std::mem::replace(&mut s.tried, true) {
+            return;
+        }
+        s.pressed = true;
+        s.events.clone()
+    };
+    let _ = events.send(DndEvent::InjectButton { pressed: true });
+}
+
+/// Carried drag: inject a press. If it has not arrived a moment later, the
+/// real button is still held (GNOME dropped it): release it and try again
+/// while the pointer is over the window.
+fn carry_try(st: &Rc<RefCell<DragState>>) {
+    let events = {
+        let mut s = st.borrow_mut();
+        if !s.settled || !s.inside || s.ended || s.started || s.trying {
+            return;
+        }
+        s.trying = true;
+        s.pressed = true;
+        s.events.clone()
+    };
+    let _ = events.send(DndEvent::InjectButton { pressed: true });
+    let st = st.clone();
+    glib::timeout_add_local_once(CARRY_CHECK, move || {
+        let unanswered = {
+            let mut s = st.borrow_mut();
+            s.trying = false;
+            !s.started && !s.ended
+        };
+        if !unanswered {
+            return;
+        }
+        st.borrow_mut().held_at = Some(std::time::Instant::now());
+        unpress(&st);
+        glib::timeout_add_local_once(CARRY_GAP, move || carry_try(&st));
+    });
+}
+
+/// Release an injected press that did not start anything.
+fn unpress(st: &Rc<RefCell<DragState>>) {
+    let events = {
+        let mut s = st.borrow_mut();
+        if !std::mem::replace(&mut s.pressed, false) {
             return;
         }
         s.events.clone()
     };
-    let _ = events.send(DndEvent::InjectButton { pressed: true });
+    let _ = events.send(DndEvent::InjectButton { pressed: false });
 }
 
 /// Drop the drag wherever the cursor is after `delay`: as soon as the
@@ -597,14 +716,8 @@ fn drop_step(st: Rc<RefCell<DragState>>, deadline: std::time::Instant) {
 /// Release the injected press (once): this drops the drag, or, if the drag
 /// is already over, just lets go of the button.
 fn let_go(st: &Rc<RefCell<DragState>>) {
-    let events = {
-        let mut s = st.borrow_mut();
-        if !s.pressed || std::mem::replace(&mut s.released, true) {
-            return;
-        }
-        s.events.clone()
-    };
-    let _ = events.send(DndEvent::InjectButton { pressed: false });
+    st.borrow_mut().released = true;
+    unpress(st);
 }
 
 /// The drop target wants the data: wait (keeping the UI responsive) until
@@ -641,8 +754,20 @@ fn wait_for_paths(st: &Rc<RefCell<DragState>>) -> Option<Vec<PathBuf>> {
 }
 
 fn cancel_drag(id: u64) {
-    let Some(d) = DRAG.with(|d| d.borrow_mut().take_if(|d| d.id == id)) else { return };
-    let ctx = d.st.borrow().ctx.clone();
+    if let Some(d) = DRAG.with(|d| d.borrow_mut().take_if(|d| d.id == id)) {
+        stop_drag(&d);
+    }
+}
+
+/// End a drag here without reporting it: cancel the native drag, let go of
+/// the injected press and stop injecting more (a carried drag keeps trying
+/// until it is over).
+fn stop_drag(d: &NativeDrag) {
+    let ctx = {
+        let mut s = d.st.borrow_mut();
+        s.ended = true;
+        s.ctx.clone()
+    };
     if let Some(ctx) = ctx {
         ctx.drag_cancel();
     }

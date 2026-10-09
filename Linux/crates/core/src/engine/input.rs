@@ -37,6 +37,8 @@ pub(crate) struct Controlled {
     pub peer: DeviceId,
     pub session: u32,
     pub pos: Point,
+    /// The controller holds the left button down here (maybe dragging).
+    pub left_held: bool,
 }
 
 fn default_desktop() -> Desktop {
@@ -374,12 +376,17 @@ impl Engine {
         let (t, s, desk) = (c.target, c.session, c.desktop.clone());
         let local = self.local_desktop();
         let pos = map_across(&desk, at, edge, &local);
+        let carrying = c.buttons.contains(&buttons::BTN_LEFT);
         self.move_drag_to(None);
         self.send_to(t, Msg::Leave { session: s });
         let _ = self.cap.send(CaptureCommand::Release { pos: Some(pos) });
         self.input = Input::Local;
         self.motion_deadline = None;
         self.flush_drag_outcome();
+        if carrying {
+            // Files dragged over there may come along.
+            self.begin_carry(t);
+        }
         self.update_edges();
         self.mark_dirty();
     }
@@ -476,8 +483,10 @@ impl Engine {
             }
             self.dnd_controller_changed();
         }
+        // Back before a drag leaving here was read: it carries on here.
+        self.abandon_leaving();
         let pos = self.local_desktop().clamp(pos);
-        self.controlled = Some(Controlled { peer, session, pos });
+        self.controlled = Some(Controlled { peer, session, pos, left_held: false });
         let _ = self.emu.send(EmulationCommand::Enter { pos });
         self.update_edges();
         self.mark_dirty();
@@ -485,7 +494,13 @@ impl Engine {
 
     pub(crate) fn on_remote_leave(&mut self, peer: DeviceId, session: u32) {
         if self.controlled.as_ref().is_some_and(|c| c.peer == peer && c.session == session) {
-            self.controlled = None;
+            let left_held = self.controlled.take().is_some_and(|c| c.left_held);
+            if left_held && self.leave_with_drag(peer) {
+                // A drag may be leaving: input is let go once it is read.
+                self.update_edges();
+                self.mark_dirty();
+                return;
+            }
             // The cursor moved on to another screen: tuck this one away.
             let park = self.local_desktop().park_point();
             let _ = self.emu.send(EmulationCommand::Leave { park: Some(park) });
@@ -520,8 +535,11 @@ impl Engine {
             }
             Msg::MoveRel { dx, dy } => EmulationCommand::MoveRel { dx: dx as f64, dy: dy as f64 },
             Msg::Button { button, pressed } => {
-                if button == buttons::BTN_LEFT && !pressed {
-                    self.dnd_remote_button_released();
+                if button == buttons::BTN_LEFT {
+                    c.left_held = pressed;
+                    if !pressed {
+                        self.dnd_remote_button_released();
+                    }
                 }
                 EmulationCommand::Button { button, pressed }
             }
