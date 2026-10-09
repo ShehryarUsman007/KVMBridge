@@ -5,7 +5,7 @@ same network, with end-to-end encryption.
 
 | Folder               | Platform                                              |
 |----------------------|-------------------------------------------------------|
-| [`Linux`](Linux)     | Ubuntu, Fedora and other Linux systems with Wayland (GNOME, KDE Plasma) |
+| [`Linux`](Linux)     | Linux with GNOME on Wayland (tested on Ubuntu and Fedora) |
 | `Windows`            | In progress                                           |
 
 See [Linux/README.md](Linux/README.md) for installing, using and building

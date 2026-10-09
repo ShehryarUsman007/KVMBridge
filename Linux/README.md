@@ -20,9 +20,10 @@ the clipboard and files come along, and everything is encrypted.
   protocol, verified with a 6-digit code when pairing).
 * Adjustable update intervals, to trade latency against CPU and network use.
 
-This folder is the Linux version: a Wayland session on GNOME 45+ (Ubuntu
-24.04, Fedora 39+) or KDE Plasma 6.1+. The Windows version is in progress and
-will live in its own folder.
+This folder is the Linux version, for a GNOME 45+ session on Wayland. It has
+been tested on Ubuntu 24.04 and Fedora with GNOME; other desktops have not
+been tried. The Windows version is in progress and will live in its own
+folder.
 
 ## Installing
 
