@@ -362,7 +362,7 @@ export function SettingsPage() {
         <h2>Files and drag and drop</h2>
         <Toggle
           label="Drag and drop between screens (all computers)"
-          hint="Drag files from a file manager on one computer and drop them on another computer's screen."
+          hint="Drag files from a file manager on one computer and drop copies of them in a folder or application on another computer's screen."
           checked={s.transfers.drag_and_drop}
           onChange={(v) => set((d) => ({ ...d, transfers: { ...d.transfers, drag_and_drop: v } }))}
         />

@@ -62,7 +62,8 @@ export function TransfersPage() {
         <div>
           <h1>File transfers</h1>
           <p className="muted">
-            Drag files across screens, copy and paste them, or drop them here. Everything is encrypted end to end.
+            Drag files across screens, copy and paste them, or drop them here. Files are always sent as copies: the
+            originals are never changed or removed. Everything is encrypted end to end.
           </p>
         </div>
         <div className="header-actions">
@@ -136,6 +137,7 @@ export function TransfersPage() {
                     </button>
                   ) : (
                     !t.outgoing &&
+                    t.kind !== "drag" &&
                     t.state === "done" &&
                     t.paths[0] && (
                       <button className="btn ghost" onClick={() => run(api.revealPath(t.paths[0]))}>

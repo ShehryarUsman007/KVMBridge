@@ -131,10 +131,13 @@ computer. The format is described in
 * Copying on one computer and pasting on another works for text, rich text,
   images and files. Large items are transferred when they are pasted.
 * **Transfers** sends files or folders to another computer, by drag and drop
-  into the window or with the file picker.
+  into the window or with the file picker. Files are always sent as copies:
+  the originals are never changed or removed.
 * Dragging files from the computer whose keyboard and mouse are used across a
-  screen edge drops them on the other computer, on the desktop, in a folder
-  or into an application. This is new and experimental. Dragging the other
+  screen edge drops copies of them on the other computer, wherever you let
+  go: in a folder, in an application, or on the desktop if it shows icons.
+  As with any drag there, letting go over something that takes no files does
+  nothing. This is new and experimental. Dragging the other
   way is not supported yet: a drag carried off a controlled computer is
   cancelled. **Status → Drag and drop → Test** tries it on one computer.
 

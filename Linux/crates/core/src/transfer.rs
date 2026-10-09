@@ -301,6 +301,37 @@ pub fn unique_path(dir: &Path, name: &str, taken: &dyn Fn(&Path) -> bool) -> Pat
     unreachable!()
 }
 
+/// Holding folders (below the cache folder) for files that arrive for a drop
+/// or a paste; the application they go to copies them from there.
+pub const DRAG_STAGING: &str = "dnd";
+pub const CLIPBOARD_STAGING: &str = "clipboard";
+/// Holding folders older than this are removed at startup.
+const STAGING_KEEP: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+
+/// A new holding folder below `cache/kind`.
+pub fn staging_dir(cache: &Path, kind: &str) -> PathBuf {
+    cache.join(kind).join(format!("{:x}", crate::crypto::random_u64()))
+}
+
+/// Removes holding folders left from earlier days.
+pub fn prune_staging(cache: &Path) {
+    for kind in [DRAG_STAGING, CLIPBOARD_STAGING] {
+        let Ok(entries) = std::fs::read_dir(cache.join(kind)) else { continue };
+        for e in entries.flatten() {
+            let old = e
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age > STAGING_KEEP);
+            if old {
+                let p = e.path();
+                let _ = if p.is_dir() { std::fs::remove_dir_all(&p) } else { std::fs::remove_file(&p) };
+            }
+        }
+    }
+}
+
 /// Removes a partially written file unless disarmed.
 struct PartGuard(Option<PathBuf>);
 impl Drop for PartGuard {

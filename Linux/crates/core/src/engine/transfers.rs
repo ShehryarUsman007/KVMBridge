@@ -229,10 +229,12 @@ impl Engine {
             s.send_to(peer, Msg::TransferReject { id: wire_id, reason: reason.into() });
         };
         let dest = match purpose {
-            TransferPurpose::Manual | TransferPurpose::Drag { .. } => Destination::Dir(self.receive_dir()),
+            TransferPurpose::Manual => Destination::Dir(self.receive_dir()),
+            // Dropped files wait in a holding folder: the application they are
+            // dropped on copies them from there (they keep their names).
+            TransferPurpose::Drag { .. } => Destination::Dir(transfer::staging_dir(&self.paths.cache_dir, transfer::DRAG_STAGING)),
             TransferPurpose::ClipboardFiles { .. } => {
-                let d = self.paths.cache_dir.join("clipboard").join(format!("{:x}", crate::crypto::random_u64()));
-                Destination::Dir(d)
+                Destination::Dir(transfer::staging_dir(&self.paths.cache_dir, transfer::CLIPBOARD_STAGING))
             }
             TransferPurpose::ClipboardBlob { .. } => {
                 if total_bytes > self.st.settings.clipboard.max_bytes {
@@ -254,7 +256,12 @@ impl Engine {
                     return reject(self, "not requested");
                 }
             }
-            TransferPurpose::Drag { drag } => self.dnd_transfer_offered(peer, drag, id),
+            TransferPurpose::Drag { drag } => {
+                if !self.dnd_transfer_offered(peer, drag, id) {
+                    self.transfers.remove(&id);
+                    return reject(self, "not dragged here");
+                }
+            }
             TransferPurpose::Manual => {}
         }
         let t = self.transfers.get_mut(&id).unwrap();

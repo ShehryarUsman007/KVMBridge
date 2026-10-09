@@ -195,6 +195,10 @@ pub(crate) struct Engine {
 pub async fn start(paths: Paths, platform: Platform, overrides: Overrides) -> anyhow::Result<EngineHandle> {
     let mut st = config::load_state(&paths)?;
     let identity = Arc::new(config::load_identity(&paths)?);
+    {
+        let cache = paths.cache_dir.clone();
+        tokio::task::spawn_blocking(move || crate::transfer::prune_staging(&cache));
+    }
     if !st.layout.contains(st.device_id) && st.layout.slots.is_empty() {
         st.layout = Layout::single(st.device_id, &st.settings.device_name);
     }

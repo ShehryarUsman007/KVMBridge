@@ -9,7 +9,10 @@
 //! the edge again to capture input on the same screen. If files were found,
 //! they stream to the target, which begins a native drag under its cursor and
 //! drops it right away into whatever application is there; that application
-//! receives the files once the transfer has completed.
+//! receives the files once the transfer has completed. Drops are always
+//! copies: the files arrive in a holding folder the application copies them
+//! from, and the originals stay where they are. Like any drop on that
+//! computer, if nothing under the cursor takes the files, nothing happens.
 
 use super::*;
 use crate::platform::ProbeOutcome;
@@ -51,7 +54,6 @@ struct OutDrag {
     drag: u64,
     target: DeviceId,
     transfer: u64,
-    paths: Vec<PathBuf>,
 }
 
 struct InDrag {
@@ -81,11 +83,7 @@ impl Engine {
     /// let go on another one. Returns true if a probe for a file drag takes
     /// the release over (the target never saw the press anyway).
     pub(crate) fn probe_drag(&mut self, button: u32) -> bool {
-        if button != crate::types::buttons::BTN_LEFT
-            || !self.dnd_enabled()
-            || self.dnd.probe.is_some()
-            || self.dnd.outgoing.is_some()
-        {
+        if button != crate::types::buttons::BTN_LEFT || !self.dnd_enabled() || self.dnd.probe.is_some() {
             return false;
         }
         let Input::Controlling(c) = &self.input else { return false };
@@ -113,9 +111,6 @@ impl Engine {
                 }
                 if self.dnd.handoff.as_ref().is_some_and(|h| h.probe == probe) {
                     self.end_handoff_drag(probe, dragging);
-                }
-                if self.dnd.outgoing.is_some() {
-                    return;
                 }
                 if paths.is_empty() {
                     tracing::info!("no files were being dragged");
@@ -161,9 +156,7 @@ impl Engine {
                     return;
                 }
                 d.ended = true;
-                let peer = d.peer;
-                let transfer = d.transfer;
-                let waiting_for_data = d.reply.is_some();
+                let (peer, transfer) = (d.peer, d.transfer);
                 tracing::info!("remote drag {drag:x} ended (accepted: {accepted})");
                 if peer == self.me() {
                     // The diagnostics test drag.
@@ -174,13 +167,12 @@ impl Engine {
                 }
                 self.send_to(peer, Msg::DragFinished { drag, accepted });
                 if !accepted {
+                    // Nothing under the cursor took the files.
                     if let Some(t) = transfer {
                         let _ = self.cancel_transfer(t, true);
                     }
                 }
-                if !waiting_for_data {
-                    self.dnd.incoming.remove(&drag);
-                }
+                self.settle_in_drag(drag);
             }
         }
     }
@@ -199,41 +191,24 @@ impl Engine {
             .collect();
         // Announce the drag first so the target can start its native drag
         // immediately; the offer follows once the files are enumerated.
-        let transfer_id = self.start_outgoing(target, paths.clone(), TransferPurpose::Drag { drag });
+        let transfer_id = self.start_outgoing(target, paths, TransferPurpose::Drag { drag });
         self.send_to(target, Msg::DragBegin { drag, transfer: transfer_id, items });
-        self.dnd.outgoing = Some(OutDrag { drag, target, transfer: transfer_id, paths });
+        self.dnd.outgoing = Some(OutDrag { drag, target, transfer: transfer_id });
     }
 
-    /// The controller's cursor moved from `old` to `next` (`None` = back home).
-    pub(crate) fn move_drag_to(&mut self, old: DeviceId, next: Option<DeviceId>) {
-        match self.dnd.outgoing.take() {
-            Some(d) if d.target == old => {
-                self.send_to(old, Msg::DragCancel { drag: d.drag });
-                let _ = self.cancel_transfer(d.transfer, true);
-                match next {
-                    Some(n) => self.begin_out_drag(n, d.paths),
-                    None => self.finish_probe(ProbeOutcome::Returned),
-                }
-            }
-            other => {
-                self.dnd.outgoing = other;
-                if next.is_none() {
-                    self.finish_probe(ProbeOutcome::Returned);
-                }
-            }
+    /// The controller's cursor moved on (`None` = back home). A drag that
+    /// went out was already dropped there (it is only sent once the button
+    /// is let go), so it is left to finish wherever the cursor goes.
+    pub(crate) fn move_drag_to(&mut self, next: Option<DeviceId>) {
+        if next.is_none() {
+            self.finish_probe(ProbeOutcome::Returned);
         }
     }
 
-    /// Control over `target` ended for another reason.
-    pub(crate) fn end_drag_for_target(&mut self, target: DeviceId, outcome: ProbeOutcome) {
-        if let Some(d) = self.dnd.outgoing.take() {
-            if d.target == target {
-                self.send_to(target, Msg::DragCancel { drag: d.drag });
-                let _ = self.cancel_transfer(d.transfer, true);
-            } else {
-                self.dnd.outgoing = Some(d);
-            }
-        }
+    /// Control over a screen ended for another reason. As above, files
+    /// already dropped there keep coming (the transfer can be cancelled on
+    /// the Transfers page).
+    pub(crate) fn end_drag_for_target(&mut self, outcome: ProbeOutcome) {
         self.finish_probe(outcome);
     }
 
@@ -414,11 +389,15 @@ impl Engine {
         let _ = self.dndcmd.send(DndCommand::StartDrag { drag, names, pos, drop_after_ms: 250 });
     }
 
-    pub(crate) fn dnd_transfer_offered(&mut self, peer: DeviceId, drag: u64, local_transfer: u64) {
-        if let Some(d) = self.dnd.incoming.get_mut(&drag) {
-            if d.peer == peer {
+    /// The files of `drag` are offered. Returns false if that drag is not
+    /// going on here (it was refused or is over), so they are declined.
+    pub(crate) fn dnd_transfer_offered(&mut self, peer: DeviceId, drag: u64, local_transfer: u64) -> bool {
+        match self.dnd.incoming.get_mut(&drag) {
+            Some(d) if d.peer == peer && d.transfer.is_none() => {
                 d.transfer = Some(local_transfer);
+                true
             }
+            _ => false,
         }
     }
 
@@ -433,7 +412,13 @@ impl Engine {
             let _ = reply.send(r.as_ref().ok().cloned());
         }
         d.result = Some(r);
-        if d.ended {
+        self.settle_in_drag(drag);
+    }
+
+    /// Forget an incoming drag once its native drag is over and nothing
+    /// waits for its files any more.
+    fn settle_in_drag(&mut self, drag: u64) {
+        if self.dnd.incoming.get(&drag).is_some_and(|d| d.ended && d.reply.is_none()) {
             self.dnd.incoming.remove(&drag);
         }
     }

@@ -240,7 +240,7 @@ impl Engine {
                 if let Input::Controlling(c) = &self.input {
                     tracing::info!("capture ended by the system");
                     let (t, s) = (c.target, c.session);
-                    self.end_drag_for_target(t, crate::platform::ProbeOutcome::Abandoned);
+                    self.end_drag_for_target(crate::platform::ProbeOutcome::Abandoned);
                     self.send_to(t, Msg::Leave { session: s });
                     self.input = Input::Local;
                     self.motion_deadline = None;
@@ -353,7 +353,7 @@ impl Engine {
         let entry = map_across(&from_desk, at, edge, &to_desk);
         let session = rand::random::<u32>();
         // Drag-and-drop follows the cursor.
-        self.move_drag_to(old, Some(next));
+        self.move_drag_to(Some(next));
         self.send_to(old, Msg::Leave { session: old_session });
         self.send_to(next, Msg::Enter { session, pos: entry });
         if let Input::Controlling(c) = &mut self.input {
@@ -374,7 +374,7 @@ impl Engine {
         let (t, s, desk) = (c.target, c.session, c.desktop.clone());
         let local = self.local_desktop();
         let pos = map_across(&desk, at, edge, &local);
-        self.move_drag_to(t, None);
+        self.move_drag_to(None);
         self.send_to(t, Msg::Leave { session: s });
         let _ = self.cap.send(CaptureCommand::Release { pos: Some(pos) });
         self.input = Input::Local;
@@ -391,7 +391,7 @@ impl Engine {
         let local = self.local_desktop();
         let t_frac = local.fraction_along(c.exit_edge, c.exit_pos);
         let pos = local.entry_point(c.exit_edge, t_frac, 8.0);
-        self.end_drag_for_target(t, crate::platform::ProbeOutcome::Abandoned);
+        self.end_drag_for_target(crate::platform::ProbeOutcome::Abandoned);
         self.send_to(t, Msg::Leave { session: s });
         let _ = self.cap.send(CaptureCommand::Release { pos: Some(pos) });
         self.input = Input::Local;
@@ -499,7 +499,7 @@ impl Engine {
         if ours {
             tracing::info!("{:?} is now controlled by another device", peer);
             let _ = self.cap.send(CaptureCommand::Release { pos: None });
-            self.end_drag_for_target(peer, crate::platform::ProbeOutcome::Abandoned);
+            self.end_drag_for_target(crate::platform::ProbeOutcome::Abandoned);
             self.input = Input::Local;
             self.motion_deadline = None;
             self.flush_drag_outcome();

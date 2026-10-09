@@ -8,12 +8,13 @@
 //!   remote-controlled cursor. Once it is fully on screen and the pointer is
 //!   over it (a small injected movement makes the compositor notice), a
 //!   button press is injected into it. That press starts a native drag of the
-//!   incoming files; the window then lets input through, and a release
-//!   injected a moment later drops the files on the application under the
-//!   cursor. When that application asks for the data, we wait until the
-//!   files have arrived and hand it their local paths. If the pointer never
-//!   gets over the window, nothing is pressed (the press would click whatever
-//!   is under the cursor instead).
+//!   incoming files; the window then lets input through, and once the
+//!   application under the cursor takes the drag (the pointer is nudged until
+//!   it does, for a moment), an injected release drops the files there. The
+//!   drag only offers copying, so the application copies the files. When it
+//!   asks for the data, we wait until the files have arrived and hand it
+//!   their local paths. If the pointer never gets over the window, nothing is
+//!   pressed (the press would click whatever is under the cursor instead).
 //! * **Sending** (`Probe`): when a button held while the cursor left this
 //!   screen is let go elsewhere, a drop target is shown under the (frozen)
 //!   local pointer. Mutter only moves a drag onto a new window when the
@@ -56,6 +57,11 @@ const SINK_WAIT: Duration = Duration::from_millis(800);
 /// How long to wait for the injected press that starts a drag (from showing
 /// the window).
 const PRESS_WAIT: Duration = Duration::from_millis(2500);
+/// While dropping, how often to check whether an application takes the drag
+/// (nudging the pointer while none does), and for how long before letting go
+/// anyway.
+const DROP_TICK: Duration = Duration::from_millis(100);
+const ACCEPT_WAIT: Duration = Duration::from_millis(2000);
 
 type Events = UnboundedSender<DndEvent>;
 
@@ -345,10 +351,15 @@ struct DragState {
     inside: bool,
     /// A press was injected (a release must follow).
     pressed: bool,
+    /// The application under the pointer takes the drag.
+    taken: bool,
+    released: bool,
     failed: bool,
     ended: bool,
     ctx: Option<gdk::DragContext>,
-    /// Local paths once known (asked for at most once).
+    /// The files were asked for (only once).
+    asked: bool,
+    /// Local paths once known.
     paths: Option<Option<Vec<PathBuf>>>,
 }
 
@@ -384,9 +395,12 @@ fn start_drag(id: u64, names: Vec<String>, pos: Point, drop_after: Duration, eve
         settled: false,
         inside: false,
         pressed: false,
+        taken: false,
+        released: false,
         failed: false,
         ended: false,
         ctx: None,
+        asked: false,
         paths: None,
     }));
     let win = overlay(Some(pos), None);
@@ -397,16 +411,32 @@ fn start_drag(id: u64, names: Vec<String>, pos: Point, drop_after: Duration, eve
             if ev.button() != 1 || std::mem::replace(&mut st.borrow_mut().started, true) {
                 return glib::Propagation::Proceed;
             }
-            let targets = gtk::TargetList::new(&[uri_target()]);
+            // A URI list, plus the file-transfer portal's types when it is
+            // there, so sandboxed (Flatpak) applications can read the files.
+            let targets = gtk::TargetList::new(&[]);
+            targets.add_uri_targets(0);
             let (x, y) = ev.position();
-            let actions = gdk::DragAction::COPY | gdk::DragAction::MOVE;
+            // Copies only: the files must stay where they are for the
+            // application to copy.
+            let actions = gdk::DragAction::COPY;
             match w.drag_begin_with_coordinates(&targets, actions, 1, Some(&**ev), x as i32, y as i32) {
                 Some(ctx) => {
                     tracing::info!("started a native drag of {} item(s)", names.len());
                     ctx.drag_set_icon_name(icon, 0, 0);
+                    {
+                        // The compositor reports the action the application
+                        // under the pointer chose (none if it takes nothing).
+                        let st = st.clone();
+                        ctx.connect_action_changed(move |_, action| {
+                            st.borrow_mut().taken = !action.is_empty();
+                        });
+                    }
                     st.borrow_mut().ctx = Some(ctx);
                     // Let the drag reach the applications under this window.
+                    // GTK only hands the new input region to the compositor
+                    // when the window is drawn again, so redraw it.
                     w.input_shape_combine_region(Some(&cairo::Region::create()));
+                    w.queue_draw();
                     drop_later(&st, drop_after);
                 }
                 None => {
@@ -514,57 +544,83 @@ fn press_into(st: &Rc<RefCell<DragState>>) {
     let _ = events.send(DndEvent::InjectButton { pressed: true });
 }
 
-/// Drop the drag wherever the cursor is after `delay`: a small nudge makes the
-/// compositor send the application under it a drag motion, then the button
-/// is let go.
+/// Drop the drag wherever the cursor is after `delay`: as soon as the
+/// application under it takes the drag, the button is let go. Small nudges
+/// make the compositor offer the drag to that application (it only moves a
+/// drag to another window when the pointer moves). If nothing takes it for
+/// a while, the button is let go anyway and the drop is refused, as it would
+/// be for any drag there.
 fn drop_later(st: &Rc<RefCell<DragState>>, delay: Duration) {
     let st = st.clone();
-    glib::timeout_add_local_once(delay, move || {
-        let (ended, events) = {
-            let s = st.borrow();
-            (s.ended, s.events.clone())
-        };
-        if ended {
+    glib::timeout_add_local_once(delay, move || drop_step(st, std::time::Instant::now() + ACCEPT_WAIT));
+}
+
+fn drop_step(st: Rc<RefCell<DragState>>, deadline: std::time::Instant) {
+    let (over, taken, events) = {
+        let s = st.borrow();
+        (s.ended || s.released, s.taken, s.events.clone())
+    };
+    if over {
+        return;
+    }
+    if taken {
+        tracing::info!("an application takes the drag; dropping it there");
+        release(&st);
+        return;
+    }
+    if std::time::Instant::now() >= deadline {
+        tracing::info!("nothing under the cursor takes the drag; letting go");
+        release(&st);
+        return;
+    }
+    let _ = events.send(DndEvent::InjectMove { dx: 1.0, dy: 0.0 });
+    let _ = events.send(DndEvent::InjectMove { dx: -1.0, dy: 0.0 });
+    glib::timeout_add_local_once(DROP_TICK, move || drop_step(st, deadline));
+}
+
+/// Inject the release that drops the drag (only once).
+fn release(st: &Rc<RefCell<DragState>>) {
+    let events = {
+        let mut s = st.borrow_mut();
+        if s.ended || std::mem::replace(&mut s.released, true) {
             return;
         }
-        let _ = events.send(DndEvent::InjectMove { dx: 1.0, dy: 0.0 });
-        let _ = events.send(DndEvent::InjectMove { dx: -1.0, dy: 0.0 });
-        glib::timeout_add_local_once(Duration::from_millis(100), move || {
-            let _ = events.send(DndEvent::InjectButton { pressed: false });
-        });
-    });
+        s.events.clone()
+    };
+    let _ = events.send(DndEvent::InjectButton { pressed: false });
 }
 
 /// The drop target wants the data: wait (keeping the UI responsive) until
-/// the files have arrived.
+/// the files have arrived. The files are asked for once; a second request
+/// while waiting (some applications read the data twice) waits for the same
+/// answer.
 fn wait_for_paths(st: &Rc<RefCell<DragState>>) -> Option<Vec<PathBuf>> {
-    if let Some(p) = st.borrow().paths.clone() {
-        return p;
-    }
-    let (id, events) = {
-        let s = st.borrow();
-        (s.id, s.events.clone())
+    let ask = {
+        let mut s = st.borrow_mut();
+        s.paths.is_none() && !std::mem::replace(&mut s.asked, true)
     };
-    let (tx, mut rx) = oneshot::channel();
-    if events.send(DndEvent::DropRequested { drag: id, reply: tx }).is_err() {
-        return None;
+    if ask {
+        let (id, events) = {
+            let s = st.borrow();
+            (s.id, s.events.clone())
+        };
+        let (tx, rx) = oneshot::channel();
+        if events.send(DndEvent::DropRequested { drag: id, reply: tx }).is_err() {
+            st.borrow_mut().paths = Some(None);
+        } else {
+            let st = st.clone();
+            glib::MainContext::default().spawn_local(async move {
+                let result = rx.await.ok().flatten();
+                tracing::info!("handing over {} dropped item(s)", result.as_ref().map_or(0, Vec::len));
+                st.borrow_mut().paths = Some(result);
+            });
+        }
     }
     let ctx = glib::MainContext::default();
-    // Wakes the loop below regularly to check for the reply.
-    let tick = glib::timeout_add_local(Duration::from_millis(30), || glib::ControlFlow::Continue);
-    let result = loop {
-        match rx.try_recv() {
-            Ok(v) => break v,
-            Err(oneshot::error::TryRecvError::Empty) => {
-                ctx.iteration(true);
-            }
-            Err(oneshot::error::TryRecvError::Closed) => break None,
-        }
-    };
-    tick.remove();
-    tracing::info!("handing over {} dropped item(s)", result.as_ref().map_or(0, Vec::len));
-    st.borrow_mut().paths = Some(result.clone());
-    result
+    while st.borrow().paths.is_none() {
+        ctx.iteration(true);
+    }
+    st.borrow().paths.clone().flatten()
 }
 
 fn cancel_drag(id: u64) {
