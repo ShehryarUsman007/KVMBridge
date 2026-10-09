@@ -33,7 +33,10 @@
 //!   the pointer once it is let go: then the press arrives at once, which
 //!   counts as "let go here" if the pointer came in well inside the window,
 //!   and as "let go elsewhere" (over a panel or dock beside it, so nothing is
-//!   dropped) if it came in over an edge.
+//!   dropped) if it came in over an edge. The drag is dropped only once the
+//!   other computer has said which files it carries (`DragFiles`); until
+//!   then it hangs on the pointer, so no application is left waiting for
+//!   files that may never come.
 //! * **Sending** (`Probe`): when a button held while the cursor left this
 //!   screen is let go elsewhere, a drop target is shown. Mutter only moves a
 //!   drag onto a new window when the pointer moves, so once it is mapped
@@ -93,6 +96,12 @@ const CARRY_EDGE: f64 = 24.0;
 /// anyway.
 const DROP_TICK: Duration = Duration::from_millis(100);
 const ACCEPT_WAIT: Duration = Duration::from_millis(2000);
+/// Carried drags: how long a drag may wait to be dropped until its files are
+/// known (the engine normally gives up on it first).
+const FILES_WAIT: Duration = Duration::from_secs(8);
+/// How long GNOME gets to cancel a drag on Escape before the injected press
+/// is let go (a release before that would drop it).
+const ESCAPE_GAP: Duration = Duration::from_millis(150);
 
 type Events = UnboundedSender<DndEvent>;
 
@@ -130,6 +139,7 @@ fn on_command(cmd: DndCommand, events: Events) {
         DndCommand::StartDrag { drag, names, drop_after_ms, after_release, .. } => {
             start_drag(drag, names, Duration::from_millis(drop_after_ms), after_release, events)
         }
+        DndCommand::DragFiles { drag, names } => drag_files(drag, names),
         DndCommand::CancelDrag { drag } => cancel_drag(drag),
     }
 }
@@ -406,6 +416,10 @@ struct DragState {
     failed: bool,
     ended: bool,
     ctx: Option<gdk::DragContext>,
+    /// Names of the files dragged, and whether they are known (a carried
+    /// drag learns them only after it started).
+    names: Vec<String>,
+    known: bool,
     /// The files were asked for (only once).
     asked: bool,
     /// Local paths once known.
@@ -432,7 +446,7 @@ fn end_drag(st: &Rc<RefCell<DragState>>, accepted: bool) {
 
 fn start_drag(id: u64, names: Vec<String>, drop_after: Duration, carried: bool, events: Events) {
     if let Some(old) = DRAG.with(|d| d.borrow_mut().take()) {
-        stop_drag(&old);
+        stop_drag(old);
     }
     let st = Rc::new(RefCell::new(DragState {
         id,
@@ -451,11 +465,12 @@ fn start_drag(id: u64, names: Vec<String>, drop_after: Duration, carried: bool, 
         failed: false,
         ended: false,
         ctx: None,
+        known: !carried,
+        names,
         asked: false,
         paths: None,
     }));
     let win = overlay(Cover::WorkArea);
-    let icon = if names.len() == 1 && !names[0].contains('.') { "folder" } else { "text-x-generic" };
     {
         let st = st.clone();
         win.connect_button_press_event(move |w, ev| {
@@ -490,7 +505,11 @@ fn start_drag(id: u64, names: Vec<String>, drop_after: Duration, carried: bool, 
             let actions = gdk::DragAction::COPY;
             match w.drag_begin_with_coordinates(&targets, actions, 1, Some(&**ev), x as i32, y as i32) {
                 Some(ctx) => {
-                    tracing::info!("started a native drag of {} item(s)", names.len());
+                    let (n, icon) = {
+                        let s = st.borrow();
+                        (s.names.len(), drag_icon(&s.names))
+                    };
+                    tracing::info!("started a native drag of {n} item(s)");
                     ctx.drag_set_icon_name(icon, 0, 0);
                     {
                         // The compositor reports the action the application
@@ -510,6 +529,7 @@ fn start_drag(id: u64, names: Vec<String>, drop_after: Duration, carried: bool, 
                 }
                 None => {
                     tracing::warn!("could not start a native drag");
+                    let_go(&st);
                     end_drag(&st, false);
                 }
             }
@@ -687,7 +707,31 @@ fn unpress(st: &Rc<RefCell<DragState>>) {
 /// be for any drag there.
 fn drop_later(st: &Rc<RefCell<DragState>>, delay: Duration) {
     let st = st.clone();
-    glib::timeout_add_local_once(delay, move || drop_step(st, std::time::Instant::now() + ACCEPT_WAIT));
+    glib::timeout_add_local_once(delay, move || wait_for_files(st, std::time::Instant::now() + FILES_WAIT));
+}
+
+/// A carried drag is dropped only once its files are known. If they never
+/// are, the drag is cancelled (the engine normally does that first), so the
+/// injected press is not left held.
+fn wait_for_files(st: Rc<RefCell<DragState>>, deadline: std::time::Instant) {
+    let (over, known) = {
+        let s = st.borrow();
+        (s.ended || s.released, s.known)
+    };
+    if over {
+        return;
+    }
+    if known {
+        drop_step(st, std::time::Instant::now() + ACCEPT_WAIT);
+        return;
+    }
+    if std::time::Instant::now() >= deadline {
+        tracing::warn!("the dragged files were never named; nothing is dropped");
+        end_drag(&st, false);
+        abort_drag(&st, None);
+        return;
+    }
+    glib::timeout_add_local_once(DROP_TICK, move || wait_for_files(st, deadline));
 }
 
 fn drop_step(st: Rc<RefCell<DragState>>, deadline: std::time::Instant) {
@@ -753,24 +797,73 @@ fn wait_for_paths(st: &Rc<RefCell<DragState>>) -> Option<Vec<PathBuf>> {
     st.borrow().paths.clone().flatten()
 }
 
-fn cancel_drag(id: u64) {
-    if let Some(d) = DRAG.with(|d| d.borrow_mut().take_if(|d| d.id == id)) {
-        stop_drag(&d);
+fn drag_icon(names: &[String]) -> &'static str {
+    if names.len() == 1 && !names[0].contains('.') {
+        "folder"
+    } else {
+        "text-x-generic"
     }
 }
 
-/// End a drag here without reporting it: cancel the native drag, let go of
-/// the injected press and stop injecting more (a carried drag keeps trying
-/// until it is over).
-fn stop_drag(d: &NativeDrag) {
+/// The files of a carried drag are known: it may be dropped.
+fn drag_files(id: u64, names: Vec<String>) {
+    let Some(st) = DRAG.with(|d| d.borrow().as_ref().filter(|d| d.id == id).map(|d| d.st.clone())) else {
+        return;
+    };
     let ctx = {
-        let mut s = d.st.borrow_mut();
-        s.ended = true;
+        let mut s = st.borrow_mut();
+        s.names = names;
+        s.known = true;
         s.ctx.clone()
     };
     if let Some(ctx) = ctx {
-        ctx.drag_cancel();
+        ctx.drag_set_icon_name(drag_icon(&st.borrow().names), 0, 0);
     }
-    let_go(&d.st);
-    d.win.close();
+}
+
+fn cancel_drag(id: u64) {
+    if let Some(d) = DRAG.with(|d| d.borrow_mut().take_if(|d| d.id == id)) {
+        stop_drag(d);
+    }
+}
+
+/// End a drag here without reporting it: cancel the native drag (without
+/// dropping it), let go of the injected press and stop injecting more (a
+/// carried drag keeps trying until it is over).
+fn stop_drag(d: NativeDrag) {
+    d.st.borrow_mut().ended = true;
+    let st = d.st.clone();
+    abort_drag(&st, Some(d.win));
+}
+
+/// Cancel a native drag without dropping it, then let go of the injected
+/// press (and close `win`). GNOME, not GTK, ends a drag on Wayland: letting
+/// go of the button drops it on whatever is under the pointer, even once
+/// GTK has cancelled it. Escape makes GNOME cancel it first.
+fn abort_drag(st: &Rc<RefCell<DragState>>, win: Option<gtk::Window>) {
+    let (live, events) = {
+        let mut s = st.borrow_mut();
+        let live = s.started && s.pressed && !s.released;
+        // No drop from here on.
+        s.released = true;
+        (live, s.events.clone())
+    };
+    let finish = move |st: &Rc<RefCell<DragState>>| {
+        let ctx = st.borrow().ctx.clone();
+        if let Some(ctx) = ctx {
+            ctx.drag_cancel();
+        }
+        unpress(st);
+        if let Some(w) = win {
+            w.close();
+        }
+    };
+    if !live {
+        // Not started, or already dropped: nothing to cancel in GNOME.
+        finish(st);
+        return;
+    }
+    let _ = events.send(DndEvent::InjectEscape);
+    let st = st.clone();
+    glib::timeout_add_local_once(ESCAPE_GAP, move || finish(&st));
 }

@@ -41,6 +41,10 @@ const NUDGE_AFTER: [u64; 2] = [80, 250];
 const PROBE_INSET: f64 = 0.25;
 /// Longest time a controlled computer spends reading a drag that leaves it.
 const LEAVE_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+/// Longest time the controller waits for the computer the cursor came back
+/// from to say what was dragged there (it reads its drag for up to
+/// [`LEAVE_PROBE_TIMEOUT`]; an older version never says).
+const CARRY_ANNOUNCE_WAIT: Duration = Duration::from_secs(5);
 
 #[derive(Default)]
 pub(crate) struct DndState {
@@ -75,6 +79,8 @@ struct Carry {
     /// Our id for the native drag here.
     drag: u64,
     peer: DeviceId,
+    /// The drag is given up if its files are not known by then.
+    deadline: Instant,
 }
 
 struct Handoff {
@@ -383,6 +389,13 @@ impl Engine {
             tracing::info!("the drag leaving this screen could not be read in time");
             self.finish_leaving(vec![]);
         }
+        let unannounced = self.dnd.carry.as_ref().filter(|c| {
+            now >= c.deadline && self.dnd.incoming.get(&c.drag).is_some_and(|d| d.remote.is_none())
+        });
+        if let Some(peer) = unannounced.map(|c| c.peer) {
+            tracing::info!("{} did not say what was dragged there; nothing is dropped here", self.peer_label(peer));
+            self.cancel_carry();
+        }
         if self.dnd.handoff.as_ref().is_none_or(|h| now < h.deadline) {
             return;
         }
@@ -478,6 +491,9 @@ impl Engine {
             if let Some(d) = self.dnd.incoming.get_mut(&local) {
                 d.remote = Some(drag);
             }
+            // The native drag here may be dropped now.
+            let names = items.into_iter().map(|i| i.rel_path).collect();
+            let _ = self.dndcmd.send(DndCommand::DragFiles { drag: local, names });
             return;
         }
         let controlled_by_peer = self.controlled.as_ref().is_some_and(|c| c.peer == peer);
@@ -506,7 +522,7 @@ impl Engine {
         let drag = crate::crypto::random_u64();
         tracing::info!("the cursor came back from {} with the button held; waiting for it to be let go", self.peer_label(peer));
         self.dnd.incoming.insert(drag, InDrag { peer, transfer: None, result: None, reply: None, ended: false, remote: None });
-        self.dnd.carry = Some(Carry { drag, peer });
+        self.dnd.carry = Some(Carry { drag, peer, deadline: Instant::now() + CARRY_ANNOUNCE_WAIT });
         let pos = self.local_desktop().center();
         let _ = self.dndcmd.send(DndCommand::StartDrag { drag, names: vec![], pos, drop_after_ms: 250, after_release: true });
     }
