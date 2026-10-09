@@ -557,6 +557,8 @@ impl Remote {
                 }
             }
             EmulationCommand::Key { code, pressed } => {
+                // Also used outside a remote session (Escape ends a local drag).
+                self.ensure_emulating();
                 if let Some(d) = self.dev.kbd.clone() {
                     if let Some(i) = self.sendable::<ei::Keyboard>(&d) {
                         i.key(code, if pressed { ei::keyboard::KeyState::Press } else { ei::keyboard::KeyState::Released });
