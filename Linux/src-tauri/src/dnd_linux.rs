@@ -2,9 +2,12 @@
 //!
 //! Wayland only tells a program about a drag when the drag is over one of
 //! its windows, and only lets it start one from a button press it received.
-//! Both are arranged with invisible full-screen windows:
+//! Both are arranged with invisible maximized windows. (Not full-screen ones:
+//! GNOME puts a black backing behind a full-screen window that is not
+//! opaque, which blacks out the screen and catches the pointer even where
+//! the window lets input through.)
 //!
-//! * **Receiving** (`StartDrag`): a window is shown on the monitor under the
+//! * **Receiving** (`StartDrag`): a window is shown under the
 //!   remote-controlled cursor. Once it is fully on screen and the pointer is
 //!   over it (a small injected movement makes the compositor notice), a
 //!   button press is injected into it. That press starts a native drag of the
@@ -13,20 +16,25 @@
 //!   it does, for a moment), an injected release drops the files there. The
 //!   drag only offers copying, so the application copies the files. When it
 //!   asks for the data, we wait until the files have arrived and hand it
-//!   their local paths. If the pointer never gets over the window, nothing is
-//!   pressed (the press would click whatever is under the cursor instead).
+//!   their local paths. If the pointer never gets over the window (it is
+//!   over a panel or dock, say), nothing is pressed (the press would click
+//!   whatever is under the cursor instead). An injected press is always
+//!   released again, however the drag ends: while it is held, GNOME ignores
+//!   every other click of that button, the touchpad's included.
 //! * **Sending** (`Probe`): when a button held while the cursor left this
-//!   screen is let go elsewhere, a drop target is shown under the (frozen)
-//!   local pointer. Mutter only moves a drag onto a new window when the
-//!   pointer moves, so once it is mapped (`ProbeReady`) the engine lets go of
-//!   input capture with the pointer moved by a pixel. A file drag in progress
-//!   then enters the window, which tells us the files; the engine ends the
-//!   local drag with Escape and captures input again.
+//!   screen is let go elsewhere, a drop target is shown. Mutter only moves a
+//!   drag onto a new window when the pointer moves, so once it is mapped
+//!   (`ProbeReady`) the engine lets go of input capture with the pointer
+//!   moved off the edge, into the window (docks and panels along the edge
+//!   are not covered by it). A file drag in progress then enters the window,
+//!   which tells us the files; the engine ends the local drag with Escape and
+//!   captures input again.
 //!   If the drag is still around when the cursor comes back (`ProbeDone`),
-//!   windows are put on every monitor; if it shows up over them it is
-//!   cancelled with Escape, so nothing lands here by accident. (Mutter
-//!   ignores a button release from the emulated pointer when that pointer
-//!   never pressed the button, so releasing cannot end the drag.)
+//!   full-screen windows are put on every monitor (they must cover the edge
+//!   where the cursor comes in); if it shows up over them it is cancelled
+//!   with Escape, so nothing lands here by accident. (Mutter ignores a
+//!   button release from the emulated pointer when that pointer never
+//!   pressed the button, so releasing cannot end the drag.)
 //!
 //! The windows are fully transparent; their CSS background is cleared too,
 //! or GTK tells the compositor they are opaque and they show up black.
@@ -35,7 +43,6 @@ use gtk::prelude::*;
 use gtk::{cairo, gdk, glib};
 use kvmbridge_core::platform::{BackendSide, BackendStatus, DndCommand, DndEvent, ProbeOutcome};
 use kvmbridge_core::transfer::{parse_uri_list, path_to_uri};
-use kvmbridge_core::types::Point;
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -94,17 +101,27 @@ thread_local! {
 
 fn on_command(cmd: DndCommand, events: Events) {
     match cmd {
-        DndCommand::Probe { probe, pos } => start_probe(probe, pos, events),
+        DndCommand::Probe { probe, .. } => start_probe(probe, events),
         DndCommand::ProbeDone { probe, outcome } => finish_probe(probe, outcome, events),
-        DndCommand::StartDrag { drag, names, pos, drop_after_ms } => {
-            start_drag(drag, names, pos, Duration::from_millis(drop_after_ms), events)
+        DndCommand::StartDrag { drag, names, drop_after_ms, .. } => {
+            start_drag(drag, names, Duration::from_millis(drop_after_ms), events)
         }
         DndCommand::CancelDrag { drag } => cancel_drag(drag),
     }
 }
 
-/// An invisible window covering the monitor at `pos` (or monitor `index`).
-fn overlay(pos: Option<Point>, index: Option<i32>) -> gtk::Window {
+/// How an overlay covers the screen.
+enum Cover {
+    /// The work area of the monitor the pointer is on, without docks and
+    /// panels; it stays see-through.
+    WorkArea,
+    /// All of monitor `index`. GNOME shows it black (see above), so only for
+    /// short-lived windows that must cover docks and panels too.
+    Monitor(i32),
+}
+
+/// An invisible window.
+fn overlay(cover: Cover) -> gtk::Window {
     let win = gtk::Window::new(gtk::WindowType::Toplevel);
     win.set_title("KVM Bridge drag and drop");
     win.set_decorated(false);
@@ -129,15 +146,10 @@ fn overlay(pos: Option<Point>, index: Option<i32>) -> gtk::Window {
         let _ = cr.paint();
         glib::Propagation::Stop
     });
-    let monitor = index.or_else(|| {
-        let p = pos?;
-        let d = gdk::Display::default()?;
-        let m = d.monitor_at_point(p.x as i32, p.y as i32)?;
-        (0..d.n_monitors()).find(|i| d.monitor(*i).as_ref() == Some(&m))
-    });
-    match (GtkWindowExt::screen(&win), monitor) {
-        (Some(screen), Some(i)) => win.fullscreen_on_monitor(&screen, i),
-        _ => win.fullscreen(),
+    match (cover, GtkWindowExt::screen(&win)) {
+        (Cover::WorkArea, _) => win.maximize(),
+        (Cover::Monitor(i), Some(screen)) => win.fullscreen_on_monitor(&screen, i),
+        (Cover::Monitor(_), None) => win.fullscreen(),
     }
     win
 }
@@ -182,14 +194,14 @@ fn close_probe_window(id: u64) {
     });
 }
 
-fn start_probe(id: u64, pos: Point, events: Events) {
+fn start_probe(id: u64, events: Events) {
     if let Some(old) = PROBE.with(|p| p.borrow_mut().take()) {
         if let Some(w) = old.win {
             w.close();
         }
     }
     let st = Rc::new(RefCell::new(ProbeState { id, events, seen: false, requested: false, reported: false, ready: false }));
-    let win = overlay(Some(pos), None);
+    let win = overlay(Cover::WorkArea);
     win.drag_dest_set(
         gtk::DestDefaults::empty(),
         &[uri_target()],
@@ -298,7 +310,7 @@ fn end_local_drag(events: Events) {
     let n = gdk::Display::default().map(|d| d.n_monitors()).unwrap_or(1).max(1);
     let sinks: Vec<gtk::Window> = (0..n)
         .map(|i| {
-            let w = overlay(None, Some(i));
+            let w = overlay(Cover::Monitor(i));
             w.drag_dest_set(gtk::DestDefaults::empty(), &[uri_target()], gdk::DragAction::all());
             let (done, events) = (done.clone(), events.clone());
             w.connect_drag_motion(move |_, ctx, _, _, time| {
@@ -381,11 +393,13 @@ fn end_drag(st: &Rc<RefCell<DragState>>, accepted: bool) {
     glib::idle_add_local_once(move || close_drag(id));
 }
 
-fn start_drag(id: u64, names: Vec<String>, pos: Point, drop_after: Duration, events: Events) {
+fn start_drag(id: u64, names: Vec<String>, drop_after: Duration, events: Events) {
     if let Some(old) = DRAG.with(|d| d.borrow_mut().take()) {
-        if let Some(ctx) = old.st.borrow().ctx.clone() {
+        let ctx = old.st.borrow().ctx.clone();
+        if let Some(ctx) = ctx {
             ctx.drag_cancel();
         }
+        let_go(&old.st);
         old.win.close();
     }
     let st = Rc::new(RefCell::new(DragState {
@@ -403,7 +417,7 @@ fn start_drag(id: u64, names: Vec<String>, pos: Point, drop_after: Duration, eve
         asked: false,
         paths: None,
     }));
-    let win = overlay(Some(pos), None);
+    let win = overlay(Cover::WorkArea);
     let icon = if names.len() == 1 && !names[0].contains('.') { "folder" } else { "text-x-generic" };
     {
         let st = st.clone();
@@ -470,6 +484,8 @@ fn start_drag(id: u64, names: Vec<String>, pos: Point, drop_after: Duration, eve
         win.connect_drag_end(move |_, _| {
             let failed = st.borrow().failed;
             end_drag(&st, !failed);
+            // Ended early (Escape, say): the injected press is still held.
+            let_go(&st);
         });
     }
     {
@@ -512,14 +528,14 @@ fn start_drag(id: u64, names: Vec<String>, pos: Point, drop_after: Duration, eve
     {
         let st = st.clone();
         glib::timeout_add_local_once(PRESS_WAIT, move || {
-            let (started, pressed, events) = {
+            let (started, pressed) = {
                 let s = st.borrow();
-                (s.started, s.pressed, s.events.clone())
+                (s.started, s.pressed)
             };
             if !started {
                 if pressed {
                     tracing::warn!("the injected press did not reach the drag window");
-                    let _ = events.send(DndEvent::InjectButton { pressed: false });
+                    let_go(&st);
                 } else {
                     tracing::warn!("the pointer did not get over the drag window; nothing was dropped");
                 }
@@ -565,12 +581,12 @@ fn drop_step(st: Rc<RefCell<DragState>>, deadline: std::time::Instant) {
     }
     if taken {
         tracing::info!("an application takes the drag; dropping it there");
-        release(&st);
+        let_go(&st);
         return;
     }
     if std::time::Instant::now() >= deadline {
         tracing::info!("nothing under the cursor takes the drag; letting go");
-        release(&st);
+        let_go(&st);
         return;
     }
     let _ = events.send(DndEvent::InjectMove { dx: 1.0, dy: 0.0 });
@@ -578,11 +594,12 @@ fn drop_step(st: Rc<RefCell<DragState>>, deadline: std::time::Instant) {
     glib::timeout_add_local_once(DROP_TICK, move || drop_step(st, deadline));
 }
 
-/// Inject the release that drops the drag (only once).
-fn release(st: &Rc<RefCell<DragState>>) {
+/// Release the injected press (once): this drops the drag, or, if the drag
+/// is already over, just lets go of the button.
+fn let_go(st: &Rc<RefCell<DragState>>) {
     let events = {
         let mut s = st.borrow_mut();
-        if s.ended || std::mem::replace(&mut s.released, true) {
+        if !s.pressed || std::mem::replace(&mut s.released, true) {
             return;
         }
         s.events.clone()
@@ -629,5 +646,6 @@ fn cancel_drag(id: u64) {
     if let Some(ctx) = ctx {
         ctx.drag_cancel();
     }
+    let_go(&d.st);
     d.win.close();
 }

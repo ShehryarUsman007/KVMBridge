@@ -26,6 +26,10 @@ const HANDOFF_TIMEOUT: Duration = Duration::from_secs(3);
 /// When to wiggle the pointer after letting go of capture (the release has
 /// to have reached the compositor, or the motion would be captured too).
 const NUDGE_AFTER: [u64; 2] = [80, 250];
+/// How far towards the middle of its monitor the pointer goes for a probe:
+/// the probe window only covers the work area, without the docks and panels
+/// along the edges.
+const PROBE_INSET: f64 = 0.25;
 
 #[derive(Default)]
 pub(crate) struct DndState {
@@ -43,7 +47,7 @@ pub(crate) struct DndState {
 struct Handoff {
     probe: u64,
     edge: Edge,
-    /// Just inside the edge where the cursor left.
+    /// Just inside the edge where the cursor left (where it goes back to).
     at: Point,
     deadline: Instant,
     /// This computer's own emulated pointer was used (to be reset after).
@@ -222,7 +226,7 @@ impl Engine {
     }
 
     /// The probe window is on screen: let go of input capture with the
-    /// pointer one pixel inside the edge, which moves the local drag onto it.
+    /// pointer moved off the edge into it, which moves the local drag onto it.
     fn release_for_probe(&mut self, probe: u64) {
         if self.dnd.probe != Some(probe) || self.dnd.handoff.is_some() {
             return;
@@ -234,8 +238,17 @@ impl Engine {
         if !local.monitors.iter().any(|m| m.contains(at)) {
             at = local.entry_point(c.exit_edge, local.fraction_along(c.exit_edge, c.exit_pos), 1.0);
         }
+        let inside = local
+            .monitors
+            .iter()
+            .find(|m| m.contains(at))
+            .map(|m| {
+                let (cx, cy) = (m.x + m.w / 2.0, m.y + m.h / 2.0);
+                Point::new(at.x + (cx - at.x) * PROBE_INSET, at.y + (cy - at.y) * PROBE_INSET)
+            })
+            .unwrap_or(at);
         tracing::info!("letting go of input for a moment so the drag here can be read");
-        let _ = self.cap.send(CaptureCommand::Release { pos: Some(at) });
+        let _ = self.cap.send(CaptureCommand::Release { pos: Some(inside) });
         self.dnd.handoff =
             Some(Handoff { probe, edge: c.exit_edge, at, deadline: Instant::now() + HANDOFF_TIMEOUT, moved: false });
         let internal = self.internal.clone();
