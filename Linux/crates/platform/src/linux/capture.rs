@@ -423,9 +423,13 @@ impl Capture {
                     self.activation = Some(id);
                     self.last_activation = Some(id);
                     match (edge, pos) {
-                        (Some(edge), Some(pos)) if !self.live.contains(&edge) => {
-                            // An edge that led somewhere earlier in this session.
-                            if !self.release(Some((pos.x, pos.y))).await {
+                        (Some(edge), Some(_)) if !self.live.contains(&edge) => {
+                            // An edge that led somewhere earlier in this
+                            // session. Given back where the pointer is: the
+                            // position GNOME reports lies on the barrier, and
+                            // a pointer put back there sets it off again with
+                            // every move, so it could never leave the edge.
+                            if !self.release(None).await {
                                 return self.orphaned("input could not be given back").await;
                             }
                         }
