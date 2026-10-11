@@ -1,0 +1,194 @@
+# Builds KVM Bridge for Linux (deb, rpm and AppImage) and Windows (installer).
+# Both carry the same version. Tags starting with "v" (for example v1.0.0)
+# attach all of them to one draft GitHub release.
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths: ["Linux/**", "Windows/**", ".github/workflows/build.yml"]
+  pull_request:
+    paths: ["Linux/**", "Windows/**", ".github/workflows/build.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    # Linux and Windows always have the same version, and a tag must match it.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Same version everywhere
+        # Every crate (as Cargo sees it), the kvmbridge entries of both
+        # Cargo.lock files, and the interface and app config files.
+        shell: python3 {0}
+        run: |
+          import json, os, subprocess, sys, tomllib
+
+          def toml(path):
+              with open(path, "rb") as f:
+                  return tomllib.load(f)
+
+          def json_file(path):
+              with open(path, encoding="utf-8") as f:
+                  return json.load(f)
+
+          version = toml("Linux/Cargo.toml")["workspace"]["package"]["version"]
+          print(f"Version {version} (Linux/Cargo.toml)")
+          errors = []
+
+          def check(file, what, found):
+              if found == version:
+                  print(f"  ok  {file}: {what} {found}")
+              else:
+                  errors.append(f"::error file={file}::{what} is {found}, expected {version} like Linux/Cargo.toml")
+
+          for ws in ("Linux", "Windows"):
+              meta = subprocess.run(
+                  ["cargo", "metadata", "--no-deps", "--format-version", "1", "--manifest-path", f"{ws}/Cargo.toml"],
+                  check=True, capture_output=True, text=True,
+              )
+              crates = json.loads(meta.stdout)["packages"]
+              locked = [p for p in toml(f"{ws}/Cargo.lock")["package"] if p["name"].startswith("kvmbridge")]
+              for c in crates:
+                  check(os.path.relpath(c["manifest_path"]), f"crate {c['name']}", c["version"])
+                  if c["name"] not in {p["name"] for p in locked}:
+                      errors.append(f"::error file={ws}/Cargo.lock::{c['name']} is missing")
+              for p in locked:
+                  check(f"{ws}/Cargo.lock", p["name"], p["version"])
+
+          check("Linux/package.json", "version", json_file("Linux/package.json")["version"])
+          npm_lock = json_file("Linux/package-lock.json")
+          check("Linux/package-lock.json", "version", npm_lock["version"])
+          check("Linux/package-lock.json", "root package", npm_lock["packages"][""]["version"])
+          check("Linux/src-tauri/tauri.conf.json", "version", json_file("Linux/src-tauri/tauri.conf.json")["version"])
+          # These take the version from elsewhere; if one ever gets its own, it must match.
+          for file in ("Windows/src-tauri/tauri.conf.json", "Windows/package.json"):
+              if "version" in json_file(file):
+                  check(file, "version", json_file(file)["version"])
+
+          if os.environ.get("GITHUB_REF_TYPE") == "tag" and os.environ["GITHUB_REF_NAME"] != f"v{version}":
+              errors.append(f"::error::Tag {os.environ['GITHUB_REF_NAME']} does not match version {version} (expected v{version})")
+
+          for e in errors:
+              print(e)
+          sys.exit(1 if errors else 0)
+
+  linux:
+    needs: version
+    # The oldest supported glibc, so the packages run on older systems too.
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        working-directory: Linux
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: System libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: Linux -> target
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: Linux/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npx tauri build --bundles deb,rpm,appimage
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kvmbridge-linux
+          path: |
+            Linux/target/release/bundle/deb/*.deb
+            Linux/target/release/bundle/rpm/*.rpm
+            Linux/target/release/bundle/appimage/*.AppImage
+          if-no-files-found: error
+
+  windows:
+    needs: version
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: Windows
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: Windows -> target
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: |
+            Linux/package-lock.json
+            Windows/package-lock.json
+      # The interface is Linux/ui, built with the Linux folder's packages.
+      - run: npm ci
+        working-directory: Linux
+      - run: npm ci
+      # NSIS installer with the WebView2 bootstrapper inside.
+      - run: npx tauri build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kvmbridge-windows
+          path: Windows/target/release/bundle/nsis/*-setup.exe
+          if-no-files-found: error
+
+  release:
+    # One draft release per tag with every package, published by hand.
+    # This is the only job that makes a release, and only once both builds
+    # have succeeded.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    # Two runs for the same tag (a re-run, a tag pushed again) wait for each
+    # other instead of both creating a draft.
+    concurrency:
+      group: release-${{ github.ref_name }}
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: packages
+      - name: Draft release
+        # gh finds draft releases by tag too (GitHub's own lookup by tag only
+        # finds published ones), so a tag that already has a draft gets its
+        # packages replaced in that draft instead of a second draft.
+        run: |
+          shopt -s failglob
+          files=(
+            packages/kvmbridge-linux/deb/*.deb
+            packages/kvmbridge-linux/rpm/*.rpm
+            packages/kvmbridge-linux/appimage/*.AppImage
+            packages/kvmbridge-windows/*-setup.exe
+          )
+          if draft=$(gh release view "$TAG" --json isDraft --jq .isDraft 2>err.txt); then
+            if [ "$draft" != true ]; then
+              echo "::error::$TAG is already published; it is left as it is"
+              exit 1
+            fi
+            echo "Updating the existing draft for $TAG"
+            gh release upload "$TAG" "${files[@]}" --clobber
+          elif grep -q "release not found" err.txt; then
+            echo "Creating the draft for $TAG"
+            gh release create "$TAG" "${files[@]}" --draft --verify-tag --title "$TAG" --notes ""
+          else
+            # Couldn't tell whether a release exists: stop rather than risk a second one.
+            cat err.txt
+            exit 1
+          fi

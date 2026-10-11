@@ -2219,7 +2219,7 @@ dependencies = [
 
 [[package]]
 name = "kvmbridge"
-version = "0.1.7"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "kvmbridge-core",
@@ -2269,7 +2269,7 @@ dependencies = [
 
 [[package]]
 name = "kvmbridge-platform"
-version = "0.1.7"
+version = "1.0.0"
 dependencies = [
  "kvmbridge-core",
  "png 0.18.1",
