@@ -148,6 +148,37 @@ let snap: Snapshot = {
   guard: { state: "off" },
   max_devices: 5,
   searching: false,
+  configs: [
+    {
+      id: "aaaaaaaa-0000-4000-8000-000000000001",
+      name: "Desk",
+      saved_ms: Date.now() - 3 * 86400000,
+      saved_by: "desk-pc",
+      members: [
+        { id: me, name: "desk-pc", paired: true },
+        { id: laptop, name: "fedora-laptop", paired: true },
+      ],
+      controller: me,
+      file: "~/.config/kvmbridge/configs/Desk.kvmb",
+      includes_me: true,
+    },
+    {
+      id: "aaaaaaaa-0000-4000-8000-000000000002",
+      name: "Office",
+      saved_ms: Date.now() - 20 * 86400000,
+      saved_by: "office-win",
+      members: [
+        { id: office, name: "office-win", paired: true },
+        { id: laptop, name: "fedora-laptop", paired: true },
+        { id: me, name: "desk-pc", paired: true },
+      ],
+      controller: office,
+      file: "~/.config/kvmbridge/configs/Office.kvmb",
+      includes_me: true,
+    },
+  ],
+  configs_dir: "~/.config/kvmbridge/configs",
+  current_config: { id: "aaaaaaaa-0000-4000-8000-000000000001", name: "Desk", modified: false },
 };
 
 type Listener = (s: Snapshot) => void;
@@ -203,7 +234,7 @@ export async function mockInvoke(cmd: string, args: Record<string, unknown> = {}
     case "pair":
       update((s) => ({
         ...s,
-        peers: s.peers.map((p) => (p.id === args.device ? { ...p, status: "pairing", pairing: { sas: "482 913", incoming: false, local_accepted: false, remote_accepted: false } } : p)),
+        peers: s.peers.map((p) => (p.id === args.device ? { ...p, status: "pairing", pairing: { sas: "482 913", incoming: false, local_accepted: false, remote_accepted: false, settings_from: me } } : p)),
       }));
       return null;
     case "accept_pair":
@@ -211,6 +242,37 @@ export async function mockInvoke(cmd: string, args: Record<string, unknown> = {}
         ...s,
         peers: s.peers.map((p) => (p.id === args.device ? { ...p, status: "connected", trusted: true, pairing: null, rtt_ms: 2.4, cipher: "aes-256-gcm" } : p)),
       }));
+      return null;
+    case "set_pair_settings":
+      update((s) => ({
+        ...s,
+        peers: s.peers.map((p) => (p.id === args.device && p.pairing ? { ...p, pairing: { ...p.pairing, settings_from: args.from as string } } : p)),
+      }));
+      return null;
+    case "save_config":
+      update((s) => {
+        const id = (args.id as string | null) ?? crypto.randomUUID();
+        const members = s.layout.slots.map((x) => ({ id: x.device, name: x.name, paired: true }));
+        const c = { id, name: String(args.name), saved_ms: Date.now(), saved_by: s.me.name, members, controller: s.layout.controller, file: `${s.configs_dir}/${args.name}.kvmb`, includes_me: true };
+        const configs = [...s.configs.filter((x) => x.id !== id), c].sort((a, b) => a.name.localeCompare(b.name));
+        return { ...s, configs, current_config: { id, name: c.name, modified: false } };
+      });
+      return null;
+    case "rename_config":
+      update((s) => ({ ...s, configs: s.configs.map((c) => (c.id === args.id ? { ...c, name: String(args.name) } : c)) }));
+      return null;
+    case "delete_config":
+      update((s) => ({
+        ...s,
+        configs: s.configs.filter((c) => c.id !== args.id),
+        current_config: s.current_config?.id === args.id ? null : s.current_config,
+      }));
+      return null;
+    case "load_config":
+      update((s) => {
+        const c = s.configs.find((x) => x.id === args.id)!;
+        return { ...s, current_config: { id: c.id, name: c.name, modified: false }, layout: { ...s.layout, controller: c.controller } };
+      });
       return null;
     case "reject_pair":
       update((s) => ({ ...s, peers: s.peers.map((p) => (p.id === args.device ? { ...p, status: "discovered", pairing: null } : p)) }));
@@ -235,6 +297,7 @@ export async function mockInvoke(cmd: string, args: Record<string, unknown> = {}
         layout_screens: 2,
         devices: [{ id: laptop, name: "fedora-laptop" }],
         from_this_device: true,
+        saved_config: null,
       };
     case "config_import":
       return { restarting: false };

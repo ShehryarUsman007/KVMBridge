@@ -322,8 +322,15 @@ impl Layout {
     /// are added at their old cell (or the nearest free one).
     pub fn merged_with(&self, other: &Layout) -> Layout {
         let (newer, older) = if self.is_newer_than(other) { (self, other) } else { (other, self) };
-        let mut out = newer.clone();
-        for s in &older.slots {
+        Layout::merge(newer, older)
+    }
+
+    /// Union of two layouts: everything from `primary` keeps its place
+    /// (and its controlling computer), devices only in `secondary` are
+    /// added at their old cell (or the nearest free one).
+    pub fn merge(primary: &Layout, secondary: &Layout) -> Layout {
+        let mut out = primary.clone();
+        for s in &secondary.slots {
             if out.contains(s.device) {
                 continue;
             }
@@ -331,7 +338,7 @@ impl Layout {
             let number = if out.slots.iter().any(|o| o.number == s.number) { out.free_number() } else { s.number };
             out.slots.push(Slot { device: s.device, col: c, row: r, number, name: s.name.clone() });
         }
-        out.rev = self.rev.max(other.rev);
+        out.rev = primary.rev.max(secondary.rev);
         out
     }
 

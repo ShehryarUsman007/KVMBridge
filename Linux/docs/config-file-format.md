@@ -62,7 +62,8 @@ u16 type || u32 length || data[length]
 | 4    | **layout**: `{rev, author, slots: [{device, col, row, number, name}], controller}` |
 | 5    | **paired devices**: `[{id, name, public_key (hex), last_addr, paired_at_ms}]` |
 | 6    | **identity** (binary, encrypted files only): 16-byte device UUID followed by the 32-byte X25519 private key |
-| 7    | *saved config* (before 0.1.4; skipped now)                                   |
+| 7    | *saved config* (before 0.1.4, another format; skipped now)                   |
+| 8    | **saved config** (since 0.1.15): `{id, name, rev, saved_ms, saved_by, layout, cipher, common}`. Files in the configs folder hold only info and this section. |
 
 Readers skip section types they do not know, so future versions can add
 sections without breaking older readers.

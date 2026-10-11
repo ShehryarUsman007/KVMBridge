@@ -2,6 +2,7 @@
 
 use crate::crypto::{CipherPreference, Identity};
 use crate::layout::Layout;
+use crate::library::{ConfigId, ConfigStamp};
 use crate::types::{keys, DeviceId};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -268,6 +269,18 @@ pub struct TrustedPeer {
     pub paired_at_ms: u64,
 }
 
+/// A computer that was unpaired from the setup. Every paired computer
+/// forgets it too (also those offline at the time, when they reconnect),
+/// unless it was paired again after `at_ms`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Removal {
+    pub id: DeviceId,
+    pub at_ms: u64,
+}
+
+/// Most removals remembered.
+pub const MAX_REMOVALS: usize = 50;
+
 /// Everything persisted in `config.json`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct State {
@@ -280,6 +293,15 @@ pub struct State {
     /// KVM Bridge is switched on (sharing input, clipboard and drops).
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Saved configs deleted here or elsewhere.
+    #[serde(default)]
+    pub deleted_configs: Vec<ConfigStamp>,
+    /// Computers unpaired from the setup.
+    #[serde(default)]
+    pub removed: Vec<Removal>,
+    /// The saved config last loaded or saved here.
+    #[serde(default)]
+    pub last_config: Option<ConfigId>,
 }
 
 fn default_true() -> bool {
@@ -298,6 +320,9 @@ impl State {
             settings,
             trusted: vec![],
             enabled: true,
+            deleted_configs: vec![],
+            removed: vec![],
+            last_config: None,
         }
     }
 
@@ -351,6 +376,10 @@ impl Paths {
     }
     pub fn log_dir(&self) -> PathBuf {
         self.cache_dir.join("logs")
+    }
+    /// The default location of saved configs.
+    pub fn configs_dir(&self) -> PathBuf {
+        self.config_dir.join("configs")
     }
 }
 

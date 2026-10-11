@@ -15,7 +15,10 @@ the clipboard and files come along, and everything is encrypted.
   dragging files from one screen to another.
 * One setup for all computers: the screen arrangement, the controlling
   computer and the shared settings are kept on every paired computer, and a
-  change on one is sent to the others right away.
+  change on one is sent to the others right away. Pairing with one computer
+  of a setup pairs with all of them.
+* Saved configs: name a setup, keep it on every paired computer and load it
+  again in one click.
 * End-to-end encryption with AES-256-GCM or ChaCha20-Poly1305 (Noise
   protocol, verified with a 6-digit code when pairing).
 * Adjustable update intervals, to trade latency against CPU and network use.
@@ -81,7 +84,8 @@ bottom-right corner when the cursor moves on.
 
 1. **Pair.** On **Devices**, click **Search** to find the computers on your
    network running KVM Bridge. Click **Pair** on one, check that both
-   computers show the same 6-digit code, and confirm on both. If a computer
+   computers show the same 6-digit code, and confirm on both. The computer
+   where you clicked **Pair** chooses whose settings both keep. If a computer
    does not show up, add it by IP address. KVM Bridge only searches when you
    click **Search**; paired computers find each other again on their own.
 2. **Arrange.** On **Screens**, drag the screens to match your desk. A
@@ -97,6 +101,24 @@ shortcuts) are stored on every paired computer. A change on one computer is
 sent to the connected ones at once; a computer that was offline catches up
 when it connects, and the newest change wins. A computer's name, ports,
 folder for received files and window preferences stay its own.
+
+### Setups
+
+The computers in one arrangement form a setup. Pairing a computer with any
+of them pairs it with all of them, without asking again. Its settings and
+arrangement come from the computer chosen when pairing; when that computer
+was already part of a setup, the others switch too. Unpairing a computer on
+any of them unpairs it from all of them (computers that were offline follow
+when they reconnect).
+
+### Saved configs
+
+**Configs** keeps named setups: the screen arrangement, the controlling
+computer, encryption and the settings shared by all computers. **Save
+current setup…** stores it on every paired computer, in the `configs`
+folder next to the settings (`~/.config/kvmbridge/configs`). **Load** makes
+it the current setup on all of its computers. Renaming and deleting reach the
+other computers too. A `.kvmb` config file can also be added from elsewhere.
 
 ### The on/off switch
 
@@ -122,9 +144,9 @@ asks once for your password to set it up (**Set up** in the banner).
 
 ### Backup
 
-**Settings → Backup and restore** saves the setup to a `.kvmb` file
-(optionally password protected) and loads it again, for example on a new
-computer. The format is described in
+**Settings → Backup and restore** saves the settings, the arrangement and the
+paired devices to a `.kvmb` file (optionally password protected) and restores
+them, for example on a new computer. The format is described in
 [docs/config-file-format.md](docs/config-file-format.md).
 
 ### Clipboard, files and drag and drop

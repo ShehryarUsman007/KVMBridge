@@ -7,6 +7,7 @@ mod dnd;
 mod input;
 mod peers;
 mod power;
+mod setup;
 mod transfers;
 pub mod view;
 
@@ -14,6 +15,7 @@ use crate::config::{self, Paths, Settings, State, Timing};
 use crate::crypto::{has_hw_aes, CipherPreference, Identity};
 use crate::discovery::{self, Beacon, DiscoveryConfig, Seen};
 use crate::layout::{Desktop, Layout};
+use crate::library::{ConfigId, Library, StoredConfig};
 use crate::net::{self, CipherPolicy, NetCtx, NetEvent};
 use crate::platform::*;
 use crate::proto::{DeviceIntro, Msg, APP_VERSION, PROTOCOL_VERSION};
@@ -43,6 +45,9 @@ pub enum Command {
     Pair(DeviceId),
     AcceptPair(DeviceId),
     RejectPair(DeviceId),
+    /// On the computer that started a pairing: whose settings both keep.
+    SetPairSettings { device: DeviceId, from: DeviceId },
+    /// Unpair a computer here and on every other computer of the setup.
     Unpair(DeviceId),
     /// Connect to `host` or `host:port` directly (no broadcast needed).
     ConnectAddress(String),
@@ -70,6 +75,16 @@ pub enum Command {
     TestDrag { seconds: u64 },
     /// Apply parts of an imported configuration file.
     ImportConfig(Box<ImportPlan>),
+    /// Save the current setup as a new config (`id: None`) or over one.
+    SaveConfig { name: String, id: Option<ConfigId> },
+    RenameConfig { id: ConfigId, name: String },
+    DeleteConfig(ConfigId),
+    /// Make a saved config the current setup (on all its computers).
+    LoadConfig(ConfigId),
+    /// Re-read the configs folder.
+    RescanConfigs,
+    /// Add a config file from elsewhere to the saved configs.
+    AddConfigFile(PathBuf),
     /// Adopt a restored identity; the app must restart afterwards.
     ReplaceIdentity { device_id: DeviceId, private_key: [u8; 32] },
     Shutdown,
@@ -167,8 +182,14 @@ pub(crate) struct Engine {
     /// Pausing of this computer's own keyboard and mouse.
     guard: GuardStatus,
     guard_sent: Option<bool>,
-    /// Peers we just paired with (merged into the arrangement on Hello).
-    just_paired: std::collections::HashSet<DeviceId>,
+    /// Peers we just paired with (merged into the arrangement on Hello),
+    /// with the computer whose settings both keep, if chosen.
+    just_paired: HashMap<DeviceId, Option<DeviceId>>,
+    /// Saved configs.
+    library: Library,
+    configs: Vec<StoredConfig>,
+    /// The setup members the others were last told about.
+    members_sent: Vec<DeviceId>,
     motion_deadline: Option<Instant>,
 
     clip: ClipState,
@@ -241,6 +262,7 @@ pub async fn start(paths: Paths, platform: Platform, overrides: Overrides) -> an
     let (notices, _) = broadcast::channel(64);
 
     let Platform { capture, emulation, clipboard, dnd } = platform;
+    let library = Library::new(paths.configs_dir());
     let mut engine = Engine {
         paths,
         st,
@@ -270,6 +292,9 @@ pub async fn start(paths: Paths, platform: Platform, overrides: Overrides) -> an
         guard: GuardStatus::Off,
         guard_sent: None,
         just_paired: Default::default(),
+        library,
+        configs: vec![],
+        members_sent: vec![],
         motion_deadline: None,
         clip: ClipState::default(),
         transfers: HashMap::new(),
@@ -287,6 +312,8 @@ pub async fn start(paths: Paths, platform: Platform, overrides: Overrides) -> an
         searching_until: None,
         shutting_down: false,
     };
+    engine.configs = engine.library.list();
+    engine.members_sent = engine.setup_members();
     let snap = engine.build_snapshot();
     let (snapshot_tx, snapshot_rx) = watch::channel(snap);
     engine.snapshot_tx = snapshot_tx;
@@ -383,6 +410,9 @@ fn dummy_snapshot() -> Snapshot {
         guard: GuardStatus::Off,
         max_devices: config::MAX_DEVICES,
         searching: false,
+        configs: vec![],
+        configs_dir: String::new(),
+        current_config: None,
     }
 }
 
@@ -540,7 +570,8 @@ impl Engine {
             Command::Pair(id) => self.start_pairing(id),
             Command::AcceptPair(id) => self.accept_pairing(id),
             Command::RejectPair(id) => self.reject_pairing(id),
-            Command::Unpair(id) => self.unpair(id, true),
+            Command::SetPairSettings { device, from } => self.set_pair_settings(device, from),
+            Command::Unpair(id) => self.unpair_everywhere(id),
             Command::ConnectAddress(a) => self.connect_address(&a),
             Command::Identify => {
                 self.identify();
@@ -567,6 +598,15 @@ impl Engine {
                 Ok(())
             }
             Command::ImportConfig(plan) => self.import_config(*plan),
+            Command::SaveConfig { name, id } => self.save_config(name, id),
+            Command::RenameConfig { id, name } => self.rename_config(id, name),
+            Command::DeleteConfig(id) => self.delete_config(id),
+            Command::LoadConfig(id) => self.load_config(id),
+            Command::RescanConfigs => {
+                self.reload_configs();
+                Ok(())
+            }
+            Command::AddConfigFile(path) => self.add_config_file(path),
             Command::ReplaceIdentity { device_id, private_key } => self.replace_identity(device_id, private_key),
             Command::RestartBackends => {
                 let _ = self.cap.send(CaptureCommand::Restart);
@@ -683,6 +723,9 @@ impl Engine {
             guard: self.guard.clone(),
             max_devices: config::MAX_DEVICES,
             searching: self.searching_until.is_some(),
+            configs: self.config_views(),
+            configs_dir: self.library.dir().display().to_string(),
+            current_config: self.current_config_view(),
         }
     }
 }

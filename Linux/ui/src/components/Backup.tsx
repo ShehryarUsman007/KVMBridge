@@ -4,7 +4,7 @@ import { open, save } from "@tauri-apps/plugin-dialog";
 import { api, errorText, inTauri, Inspection } from "../api";
 import { useEngine } from "../store";
 
-const FILTERS = [{ name: "KVM Bridge configuration", extensions: ["kvmb"] }];
+const FILTERS = [{ name: "KVM Bridge backup", extensions: ["kvmb"] }];
 
 function Check({ checked, onChange, label, hint, disabled }: { checked: boolean; onChange: (v: boolean) => void; label: string; hint?: string; disabled?: boolean }) {
   return (
@@ -41,7 +41,7 @@ export function ExportDialog({ onClose }: { onClose: () => void }) {
     setBusy(true);
     const ok = await run(
       api.configExport(path, { settings, layout, devices, identity, password: password || null, note }).then((p) =>
-        pushToast({ kind: "success", title: "Configuration saved", body: p }),
+        pushToast({ kind: "success", title: "Backup saved", body: p }),
       ),
     );
     setBusy(false);
@@ -51,7 +51,7 @@ export function ExportDialog({ onClose }: { onClose: () => void }) {
   return (
     <div className="modal-backdrop" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
       <div className="modal dialog" role="dialog" aria-modal="true" aria-labelledby="export-title">
-        <h2 id="export-title">Save configuration</h2>
+        <h2 id="export-title">Save backup</h2>
         <p className="muted small">Creates a .kvmb file you can keep as a backup or load on another computer.</p>
         <div className="check-list">
           <Check checked={settings} onChange={setSettings} label="Settings" hint="Timing, clipboard, shortcuts, network and encryption choice." />
@@ -136,7 +136,7 @@ export function ImportDialog({ path, onClose }: { path: string; onClose: () => v
     if (ok) {
       pushToast({
         kind: "success",
-        title: restarting ? "Identity restored — restarting KVM Bridge" : "Configuration loaded",
+        title: restarting ? "Identity restored — restarting KVM Bridge" : "Backup restored",
       });
       onClose();
     }
@@ -146,10 +146,42 @@ export function ImportDialog({ path, onClose }: { path: string; onClose: () => v
   const info = inspection?.info;
   const locked = inspection?.needs_password;
 
+  if (inspection?.saved_config) {
+    const name = inspection.saved_config;
+    return (
+      <div className="modal-backdrop" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
+        <div className="modal dialog" role="dialog" aria-modal="true" aria-labelledby="import-title">
+          <h2 id="import-title">Add saved config</h2>
+          <p className="muted small mono">{fileName}</p>
+          <p>
+            This file is the saved config <b>{name}</b>. Add it to your configs to load it from the Configs page.
+          </p>
+          <div className="modal-actions end">
+            <button className="btn" onClick={onClose}>
+              Cancel
+            </button>
+            <button
+              className="btn primary"
+              disabled={busy}
+              onClick={async () => {
+                setBusy(true);
+                const ok = await run(api.addConfigFile(path), `Added "${name}" to your configs`);
+                setBusy(false);
+                if (ok) onClose();
+              }}
+            >
+              Add to configs
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="modal-backdrop" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
       <div className="modal dialog" role="dialog" aria-modal="true" aria-labelledby="import-title">
-        <h2 id="import-title">Load configuration</h2>
+        <h2 id="import-title">Restore from backup</h2>
         <p className="muted small mono">{fileName}</p>
         {error && <div className="notice bad small">{error}</div>}
         {locked && (
@@ -233,7 +265,7 @@ export function ImportDialog({ path, onClose }: { path: string; onClose: () => v
             disabled={busy || !inspection || locked || !(sel.settings || sel.layout || sel.devices || sel.identity)}
             onClick={doImport}
           >
-            Load
+            Restore
           </button>
         </div>
       </div>
@@ -249,7 +281,7 @@ export function BackupSection() {
     <>
       <div className="row wrap">
         <button className="btn" onClick={() => setExporting(true)}>
-          Save configuration…
+          Save backup…
         </button>
         <button
           className="btn"
@@ -258,7 +290,7 @@ export function BackupSection() {
             if (typeof f === "string") setImportPath(f);
           }}
         >
-          Load configuration…
+          Restore from backup…
         </button>
       </div>
       {exporting && <ExportDialog onClose={() => setExporting(false)} />}

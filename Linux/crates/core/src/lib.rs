@@ -5,6 +5,7 @@
 
 pub mod crypto;
 pub mod layout;
+pub mod library;
 pub mod types;
 pub mod config;
 pub mod configfile;

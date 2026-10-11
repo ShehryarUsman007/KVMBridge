@@ -3,6 +3,7 @@
 use crate::config::{Settings, SharedSettings};
 use crate::crypto::Cipher;
 use crate::layout::{Desktop, Layout};
+use crate::library::ConfigId;
 use crate::platform::BackendStatus;
 use crate::proto::{Capabilities, ItemMeta};
 use crate::platform::GuardStatus;
@@ -30,6 +31,41 @@ pub struct Snapshot {
     pub max_devices: usize,
     /// A search for devices on the network is running.
     pub searching: bool,
+    /// Saved configs, sorted by name.
+    pub configs: Vec<ConfigView>,
+    /// Where saved configs are kept.
+    pub configs_dir: String,
+    pub current_config: Option<CurrentConfigView>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ConfigMemberView {
+    pub id: DeviceId,
+    pub name: String,
+    /// This computer, or one it is paired with.
+    pub paired: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ConfigView {
+    pub id: ConfigId,
+    pub name: String,
+    pub saved_ms: u64,
+    /// Name of the computer it was saved on.
+    pub saved_by: String,
+    pub members: Vec<ConfigMemberView>,
+    pub controller: Option<DeviceId>,
+    pub file: String,
+    pub includes_me: bool,
+}
+
+/// The saved config the current setup comes from.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct CurrentConfigView {
+    pub id: ConfigId,
+    pub name: String,
+    /// The setup changed since it was loaded or saved.
+    pub modified: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -63,6 +99,9 @@ pub struct PairingView {
     pub incoming: bool,
     pub local_accepted: bool,
     pub remote_accepted: bool,
+    /// Both computers keep this computer's settings (`None`: not chosen;
+    /// pairing with an older version, the newest settings win).
+    pub settings_from: Option<DeviceId>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]

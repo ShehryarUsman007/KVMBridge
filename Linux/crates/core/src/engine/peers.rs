@@ -66,6 +66,9 @@ pub(crate) struct Pairing {
     pub local_ok: bool,
     pub remote_ok: bool,
     pub started: Instant,
+    /// Both computers keep this computer's settings. The computer that
+    /// started the pairing chooses (see [`Msg::PairSettings`]).
+    pub settings_from: Option<DeviceId>,
 }
 
 pub(crate) struct ConnState {
@@ -399,6 +402,14 @@ impl Engine {
             conn.close();
             return;
         }
+        if incoming && self.st.layout.contains(intro.id) {
+            // A computer of our setup that already trusts us, before we
+            // heard about it (see `on_introduce`): it connects again later.
+            tracing::debug!("{} is not paired yet; waiting to hear about it from the setup", intro.name);
+            conn.close();
+            self.conns.remove(&conn.id);
+            return;
+        }
         if self.st.trusted.len() + 1 >= crate::config::MAX_DEVICES {
             let name = p.name.clone();
             p.want_pair = false;
@@ -423,11 +434,14 @@ impl Engine {
             local_ok: false,
             remote_ok: false,
             started: now,
+            settings_from: if incoming { None } else { Some(me) },
         });
         p.want_pair = false;
         let name = p.name.clone();
         if incoming {
             self.notice(Notice::PairingRequest { device: intro.id, name, sas: conn.sas.clone() });
+        } else {
+            conn.send(Msg::PairSettings { from: me });
         }
         self.mark_dirty();
     }
@@ -458,6 +472,7 @@ impl Engine {
         if let Some((seq, formats)) = self.clip.local.clone().filter(|_| self.clipboard_on()) {
             self.send_to(peer, Msg::ClipOffer { seq, formats: self.shareable_formats(&formats) });
         }
+        self.sync_setup_with(peer);
         self.update_edges();
         self.mark_dirty();
     }
@@ -520,6 +535,16 @@ impl Engine {
                     }
                 }
                 self.maybe_finish_pairing(peer);
+                self.mark_dirty();
+                return;
+            }
+            Msg::PairSettings { from } if !active => {
+                let me = self.me();
+                if let Some(x) = self.peers.get_mut(&peer).and_then(|p| p.pairing.as_mut()) {
+                    if x.incoming && (from == peer || from == me) {
+                        x.settings_from = Some(from);
+                    }
+                }
                 self.mark_dirty();
                 return;
             }
@@ -599,6 +624,11 @@ impl Engine {
             Msg::DragBegin { drag, transfer, items } => self.on_drag_begin(peer, drag, transfer, items),
             Msg::DragCancel { drag } => self.on_drag_cancel(peer, drag),
             Msg::DragFinished { drag, accepted } => self.on_drag_finished(peer, drag, accepted),
+            Msg::Introduce(list) => self.on_introduce(peer, list),
+            Msg::Forget(list) => self.on_forget(peer, list),
+            Msg::ConfigSync(c) => self.on_config_sync(*c),
+            Msg::ConfigDelete(t) => self.on_config_delete(t),
+            Msg::PairSettings { .. } => {}
             Msg::Ping { .. } | Msg::Pong { .. } | Msg::PairAccept | Msg::PairReject { .. } => {}
         }
     }
@@ -639,6 +669,29 @@ impl Engine {
             c.handle.send(Msg::PairAccept);
         }
         self.maybe_finish_pairing(id);
+        self.mark_dirty();
+        Ok(())
+    }
+
+    /// On the computer that started the pairing: both keep the settings of
+    /// `from` (this computer or the other one).
+    pub(crate) fn set_pair_settings(&mut self, id: DeviceId, from: DeviceId) -> Result<(), String> {
+        let me = self.me();
+        if from != me && from != id {
+            return Err("Choose one of the two computers".into());
+        }
+        let p = self.peers.get_mut(&id).ok_or("Unknown device")?;
+        let pairing = p.pairing.as_mut().ok_or("No pairing in progress")?;
+        if pairing.incoming {
+            return Err("The computer that started the pairing chooses".into());
+        }
+        if pairing.local_ok {
+            return Err("The pairing is already confirmed".into());
+        }
+        pairing.settings_from = Some(from);
+        if let Some(c) = self.conns.get(&pairing.conn) {
+            c.handle.send(Msg::PairSettings { from });
+        }
         self.mark_dirty();
         Ok(())
     }
@@ -686,6 +739,7 @@ impl Engine {
         let Some(c) = self.conns.get(&conn) else { return };
         let key = hex::encode(c.handle.remote_key);
         let name = p.name.clone();
+        let settings_from = pairing.settings_from;
         p.pairing = None;
         self.st.trusted.retain(|t| t.id != id);
         self.st.trusted.push(TrustedPeer {
@@ -699,7 +753,8 @@ impl Engine {
         tracing::info!("paired with {name}");
         self.notice(Notice::Paired { device: id, name });
         // Put the new computer into the arrangement (see `on_hello`).
-        self.just_paired.insert(id);
+        self.just_paired.insert(id, settings_from);
+        self.forget_removal(id);
         self.activate(conn);
     }
 
@@ -753,16 +808,32 @@ impl Engine {
             p.heartbeat_ms = h.heartbeat_ms.max(100);
         }
         self.on_peer_geometry(peer, h.desktop.clone());
-        if h.shared.version() > self.st.shared.version() {
-            self.adopt_shared(h.shared.clone(), Some(peer));
+        let fresh = self.just_paired.remove(&peer);
+        let keep = fresh.flatten();
+        match keep {
+            // Just paired, and the settings to keep were chosen: both
+            // computers make the same, newer version of them, which then
+            // reaches the rest of both setups.
+            Some(from) => {
+                let base = if from == me { self.st.shared.clone() } else { h.shared.clone() };
+                let s = SharedSettings { rev: self.st.shared.rev.max(h.shared.rev) + 1, author: from, ..base };
+                tracing::info!("keeping the settings of {}", if from == me { "this computer".into() } else { self.peer_label(from) });
+                self.adopt_shared(s, None);
+            }
+            None if h.shared.version() > self.st.shared.version() => self.adopt_shared(h.shared.clone(), Some(peer)),
+            None => {}
         }
         let both_present = self.st.layout.contains(peer) && h.layout.contains(me);
-        let fresh = self.just_paired.remove(&peer);
-        if !fresh || both_present {
+        if fresh.is_none() || both_present {
             self.consider_layout(peer, h.layout);
         } else if me < peer {
-            // Just paired: we lead the merge for this pair.
-            let mut merged = self.st.layout.merged_with(&h.layout);
+            // Just paired: we lead the merge for this pair. The arrangement
+            // of the computer whose settings are kept keeps its places.
+            let mut merged = match keep {
+                Some(from) if from == me => Layout::merge(&self.st.layout, &h.layout),
+                Some(_) => Layout::merge(&h.layout, &self.st.layout),
+                None => self.st.layout.merged_with(&h.layout),
+            };
             if !merged.contains(me) {
                 let n = self.st.settings.device_name.clone();
                 merged.place_next_to(me, &n, peer);
@@ -813,6 +884,7 @@ impl Engine {
         self.broadcast_except(from, Msg::Layout(self.st.layout.clone()));
         self.schedule_save();
         self.apply_controls();
+        self.setup_changed();
         self.mark_dirty();
     }
 
@@ -894,6 +966,7 @@ impl Engine {
             incoming: x.incoming,
             local_accepted: x.local_ok,
             remote_accepted: x.remote_ok,
+            settings_from: x.settings_from,
         });
         let cipher = p
             .pairing

@@ -574,6 +574,14 @@ textarea.input {
 .power-toggle.on {
   color: var(--text);
 }
+.power-config {
+  color: var(--muted);
+  border-left: 1px solid var(--border);
+  padding-left: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 .banner.bad > svg {
   color: var(--bad);
 }
@@ -921,6 +929,36 @@ kbd {
 .status-text.connecting {
   color: var(--warn);
 }
+/* ---------- configs */
+.config-row.active {
+  border-color: var(--accent);
+}
+.config-controller {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.configs-modified {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 0 0 12px;
+}
+.configs-folder {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 16px;
+  font-size: 12.5px;
+}
+.configs-folder .path {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
 .add-by-ip {
   margin-top: 24px;
 }
@@ -1259,6 +1297,14 @@ kbd {
 }
 .modal-actions.end {
   justify-content: flex-end;
+}
+.pair-keep {
+  text-align: left;
+  margin: 4px 0 8px;
+}
+.pair-keep .field-label {
+  display: block;
+  margin-bottom: 4px;
 }
 .toasts {
   position: fixed;

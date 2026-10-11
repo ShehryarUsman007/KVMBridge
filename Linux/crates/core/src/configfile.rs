@@ -2,7 +2,7 @@
 //!
 //! A small, versioned, sectioned container for backups of settings, the
 //! screen arrangement, paired devices and (optionally, only in
-//! password-protected files) this computer's identity. See `docs/config-file-format.md` for the byte-level
+//! password-protected files) this computer's identity, and for saved configs. See `docs/config-file-format.md` for the byte-level
 //! specification.
 //!
 //! ```text
@@ -19,6 +19,7 @@
 use crate::config::{Settings, SharedSettings, TrustedPeer};
 use crate::crypto::Cipher;
 use crate::layout::Layout;
+use crate::library::SavedConfig;
 use crate::types::DeviceId;
 use serde::{Deserialize, Serialize};
 
@@ -38,7 +39,8 @@ const SEC_SHARED: u16 = 3;
 const SEC_LAYOUT: u16 = 4;
 const SEC_DEVICES: u16 = 5;
 const SEC_IDENTITY: u16 = 6;
-// 7 held saved configs (before 0.1.4); such sections are skipped now.
+// 7 held saved configs before 0.1.4 (another format); such sections are skipped.
+const SEC_CONFIG: u16 = 8;
 
 const KDF_ARGON2ID: u8 = 1;
 /// Argon2id parameters for new files (64 MiB, 3 passes).
@@ -80,6 +82,8 @@ pub struct ConfigBundle {
     pub layout: Option<Layout>,
     pub devices: Option<Vec<TrustedPeer>>,
     pub identity: Option<IdentityBackup>,
+    /// A saved config (files in the configs folder hold only this).
+    pub config: Option<SavedConfig>,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq)]
@@ -150,6 +154,9 @@ fn sections(b: &ConfigBundle) -> Vec<u8> {
         d.extend_from_slice(id.device_id.0.as_bytes());
         d.extend_from_slice(&id.private_key);
         push_section(&mut s, SEC_IDENTITY, &d);
+    }
+    if let Some(x) = &b.config {
+        push_section(&mut s, SEC_CONFIG, &json(x));
     }
     s
 }
@@ -315,6 +322,7 @@ fn parse_sections(mut s: &[u8], hdr: Header) -> Result<ConfigBundle, BundleError
         layout: None,
         devices: None,
         identity: None,
+        config: None,
     };
     while !s.is_empty() {
         if s.len() < 6 {
@@ -332,6 +340,7 @@ fn parse_sections(mut s: &[u8], hdr: Header) -> Result<ConfigBundle, BundleError
             SEC_SHARED => b.shared = Some(serde_json::from_slice(data).map_err(|e| bad("encryption settings", e))?),
             SEC_LAYOUT => b.layout = Some(serde_json::from_slice(data).map_err(|e| bad("arrangement", e))?),
             SEC_DEVICES => b.devices = Some(serde_json::from_slice(data).map_err(|e| bad("devices", e))?),
+            SEC_CONFIG => b.config = Some(serde_json::from_slice(data).map_err(|e| bad("saved config", e))?),
             SEC_IDENTITY => {
                 if !hdr.encrypted {
                     return Err(BundleError::Corrupt("identity in an unencrypted file".into()));

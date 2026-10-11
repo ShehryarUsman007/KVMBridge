@@ -81,6 +81,7 @@ impl Engine {
             l.slots.truncate(MAX_DEVICES);
             self.set_layout_from_ui(l)?;
         }
+        self.setup_changed();
         self.save_now();
         self.update_edges();
         self.mark_dirty();

@@ -1,4 +1,4 @@
-import { api } from "../api";
+import { api, PeerView, Snapshot } from "../api";
 import { useEngine } from "../store";
 import { IconAlert, IconCheck, IconInfo, IconShield, IconX } from "./Icons";
 
@@ -33,6 +33,45 @@ export function Toasts() {
   );
 }
 
+/** Whose settings both computers keep, in words. */
+function keepText(snap: Snapshot, peer: PeerView): string | null {
+  const from = peer.pairing?.settings_from;
+  if (!from) return null;
+  return from === snap.me.id
+    ? `${peer.name} will use this computer's settings and screen arrangement.`
+    : `This computer will use ${peer.name}'s settings and screen arrangement.`;
+}
+
+/** On the computer that started the pairing: choose whose settings both keep. */
+function KeepChoice({ snap, peer }: { snap: Snapshot; peer: PeerView }) {
+  const { run } = useEngine();
+  const from = peer.pairing?.settings_from ?? snap.me.id;
+  const options: [string, string, string][] = [
+    [snap.me.id, `${snap.me.name} (this computer)`, `${peer.name} switches to this computer's settings.`],
+    [peer.id, peer.name, `This computer switches to ${peer.name}'s settings.`],
+  ];
+  return (
+    <div className="pair-keep">
+      <span className="field-label">Settings to keep</span>
+      <div className="choice-list">
+        {options.map(([value, label, desc]) => (
+          <label key={value} className={`choice ${from === value ? "selected" : ""}`}>
+            <input type="radio" name="pair-keep" checked={from === value} onChange={() => run(api.setPairSettings(peer.id, value))} />
+            <div>
+              <div className="choice-title">{label}</div>
+              <div className="muted small">{desc}</div>
+            </div>
+          </label>
+        ))}
+      </div>
+      <div className="muted small">
+        This covers the settings shared by all computers and the screen arrangement. Computers already set up with either one
+        are paired too and follow the same settings.
+      </div>
+    </div>
+  );
+}
+
 /** Pairing confirmation: shown for incoming requests and for pairings we started. */
 export function PairingDialog() {
   const { snap, run, pairingRequests, dismissPairing } = useEngine();
@@ -54,6 +93,7 @@ export function PairingDialog() {
           <h2>Waiting for {waiting.name}</h2>
           <p className="muted">Confirm this code on {waiting.name}.</p>
           <div className="sas">{waiting.pairing!.sas}</div>
+          {keepText(snap, waiting) && <p className="small muted">{keepText(snap, waiting)}</p>}
           <div className="modal-actions">
             <button className="btn ghost" onClick={() => run(api.rejectPair(waiting.id))}>
               Cancel
@@ -78,6 +118,8 @@ export function PairingDialog() {
         <h2 id="pair-title">{incoming ? `Pairing request from ${name}` : `Pair with ${name}`}</h2>
         <p className="muted">Make sure {name} shows the same code before you continue.</p>
         <div className="sas">{sas}</div>
+        {req && !incoming && <KeepChoice snap={snap} peer={req} />}
+        {req && incoming && keepText(snap, req) && <p className="small">{keepText(snap, req)}</p>}
         {remoteOk && <p className="small ok-text">{name} already confirmed the code.</p>}
         <div className="modal-actions">
           <button

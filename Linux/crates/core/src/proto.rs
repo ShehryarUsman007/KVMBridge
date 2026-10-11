@@ -1,7 +1,8 @@
 //! Messages exchanged over the encrypted control channel and data channels.
 
-use crate::config::SharedSettings;
+use crate::config::{Removal, SharedSettings};
 use crate::layout::{Desktop, Layout};
+use crate::library::{ConfigStamp, SavedConfig};
 use crate::types::{ClipFormat, DeviceId, Point};
 use serde::{Deserialize, Serialize};
 
@@ -67,6 +68,21 @@ pub enum TransferPurpose {
     ClipboardBlob { req: u64 },
 }
 
+/// A computer of the sender's setup, which the receiver should pair with
+/// too (it is in the same arrangement).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Introduction {
+    pub id: DeviceId,
+    pub name: String,
+    /// Hex encoded X25519 public key.
+    pub public_key: String,
+    /// Last address the sender reached it at.
+    pub addr: Option<String>,
+    pub paired_at_ms: u64,
+}
+
+/// New messages go at the end: older versions skip messages they cannot
+/// decode, so these stay compatible without a new protocol version.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Msg {
     Hello(Box<Hello>),
@@ -126,6 +142,19 @@ pub enum Msg {
     DragBegin { drag: u64, transfer: u64, items: Vec<ItemMeta> },
     DragCancel { drag: u64 },
     DragFinished { drag: u64, accepted: bool },
+
+    // ---- setups (0.1.15)
+    /// Sent by the computer that started a pairing: after pairing, both
+    /// keep the settings of `from`.
+    PairSettings { from: DeviceId },
+    /// The other computers of the sender's setup (see [`Introduction`]).
+    Introduce(Vec<Introduction>),
+    /// Computers unpaired from the setup; the receiver unpairs them too.
+    Forget(Vec<Removal>),
+    /// A saved config (stored if newer than the receiver's copy).
+    ConfigSync(Box<SavedConfig>),
+    /// A saved config was deleted.
+    ConfigDelete(ConfigStamp),
 }
 
 impl Msg {

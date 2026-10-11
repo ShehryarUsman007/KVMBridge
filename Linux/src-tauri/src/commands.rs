@@ -4,6 +4,7 @@ use crate::AppState;
 use kvmbridge_core::config::Settings;
 use kvmbridge_core::crypto::CipherPreference;
 use kvmbridge_core::layout::Layout;
+use kvmbridge_core::library::ConfigId;
 use kvmbridge_core::types::DeviceId;
 use kvmbridge_core::{Command, Snapshot};
 use std::path::PathBuf;
@@ -13,6 +14,10 @@ type R<T = ()> = Result<T, String>;
 
 fn id(s: &str) -> R<DeviceId> {
     s.parse().map_err(|_| format!("invalid device id {s:?}"))
+}
+
+fn config_id(s: &str) -> R<ConfigId> {
+    s.parse().map_err(|_| format!("invalid config id {s:?}"))
 }
 
 #[tauri::command]
@@ -82,6 +87,12 @@ pub async fn reject_pair(state: State<'_, AppState>, device: String) -> R {
     state.engine.request(Command::RejectPair(id(&device)?)).await
 }
 
+/// On the computer that started a pairing: whose settings both computers keep.
+#[tauri::command]
+pub async fn set_pair_settings(state: State<'_, AppState>, device: String, from: String) -> R {
+    state.engine.request(Command::SetPairSettings { device: id(&device)?, from: id(&from)? }).await
+}
+
 #[tauri::command]
 pub async fn unpair(state: State<'_, AppState>, device: String) -> R {
     state.engine.request(Command::Unpair(id(&device)?)).await
@@ -126,6 +137,54 @@ pub async fn set_locked(state: State<'_, AppState>, locked: bool) -> R {
 #[tauri::command]
 pub async fn restart_backends(state: State<'_, AppState>) -> R {
     state.engine.request(Command::RestartBackends).await
+}
+
+#[tauri::command]
+pub async fn save_config(state: State<'_, AppState>, name: String, id: Option<String>) -> R {
+    let id = id.as_deref().map(config_id).transpose()?;
+    state.engine.request(Command::SaveConfig { name, id }).await
+}
+
+#[tauri::command]
+pub async fn rename_config(state: State<'_, AppState>, id: String, name: String) -> R {
+    state.engine.request(Command::RenameConfig { id: config_id(&id)?, name }).await
+}
+
+#[tauri::command]
+pub async fn delete_config(state: State<'_, AppState>, id: String) -> R {
+    state.engine.request(Command::DeleteConfig(config_id(&id)?)).await
+}
+
+#[tauri::command]
+pub async fn load_config(state: State<'_, AppState>, id: String) -> R {
+    state.engine.request(Command::LoadConfig(config_id(&id)?)).await
+}
+
+#[tauri::command]
+pub async fn rescan_configs(state: State<'_, AppState>) -> R {
+    state.engine.request(Command::RescanConfigs).await
+}
+
+#[tauri::command]
+pub async fn add_config_file(state: State<'_, AppState>, path: String) -> R {
+    state.engine.request(Command::AddConfigFile(PathBuf::from(path))).await
+}
+
+/// Save a copy of a saved config's file elsewhere.
+#[tauri::command]
+pub fn export_config_file(state: State<'_, AppState>, id: String, path: String) -> R {
+    let id = config_id(&id)?;
+    let snap = state.engine.snapshot();
+    let c = snap.configs.iter().find(|c| c.id == id).ok_or("That config no longer exists")?;
+    std::fs::copy(&c.file, &path).map_err(|e| format!("Cannot save {path}: {e}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn open_configs_dir(state: State<'_, AppState>) -> R {
+    let dir = state.paths.configs_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    tauri_plugin_opener::open_path(dir, None::<&str>).map_err(|e| e.to_string())
 }
 
 #[tauri::command]

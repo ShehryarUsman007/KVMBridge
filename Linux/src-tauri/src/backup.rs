@@ -47,6 +47,8 @@ pub struct Inspection {
     pub devices: Vec<DeviceSummary>,
     /// The file was made on this very computer.
     pub from_this_device: bool,
+    /// The file is a saved config with this name.
+    pub saved_config: Option<String>,
 }
 
 fn read(path: &str) -> Result<Vec<u8>, String> {
@@ -76,6 +78,7 @@ pub async fn config_export(state: State<'_, AppState>, path: String, options: Ex
         layout: options.layout.then(|| st.layout.clone()),
         devices: options.devices.then(|| st.trusted.clone()),
         identity,
+        config: None,
     };
     let bytes = configfile::encode(&bundle, options.password.as_deref(), st.shared.cipher.resolve()).map_err(|e| e.to_string())?;
     let mut path = PathBuf::from(path);
@@ -110,6 +113,7 @@ pub async fn config_inspect(state: State<'_, AppState>, path: String, password: 
                 .into_iter()
                 .map(|d| DeviceSummary { id: d.id.to_string(), name: d.name })
                 .collect(),
+            saved_config: b.config.map(|c| c.name),
             info: Some(b.info),
         }),
         Err(BundleError::PasswordRequired) => Ok(Inspection {
@@ -122,6 +126,7 @@ pub async fn config_inspect(state: State<'_, AppState>, path: String, password: 
             layout_screens: None,
             devices: vec![],
             from_this_device: false,
+            saved_config: None,
         }),
         Err(e) => Err(e.to_string()),
     }

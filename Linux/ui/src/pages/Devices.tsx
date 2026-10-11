@@ -177,7 +177,7 @@ export function DevicesPage() {
                 <button
                   className="btn ghost danger"
                   onClick={() => {
-                    if (window.confirm(`Unpair ${p.name}? You will have to pair again to use it.`)) run(api.unpair(p.id));
+                    if (window.confirm(`Unpair ${p.name}? It's unpaired from every computer in this setup, and you'll have to pair again to use it.`)) run(api.unpair(p.id));
                   }}
                 >
                   <IconTrash /> Unpair

@@ -119,7 +119,14 @@ export interface PeerView {
   trusted: boolean;
   rtt_ms: number | null;
   cipher: Cipher | null;
-  pairing: { sas: string; incoming: boolean; local_accepted: boolean; remote_accepted: boolean } | null;
+  pairing: {
+    sas: string;
+    incoming: boolean;
+    local_accepted: boolean;
+    remote_accepted: boolean;
+    /** Both computers keep this computer's settings (null: not chosen, the newest settings win). */
+    settings_from: DeviceId | null;
+  } | null;
   desktop: Desktop | null;
   caps: Capabilities;
   error: string | null;
@@ -153,6 +160,19 @@ export interface TransferView {
   paths: string[];
 }
 
+/** A saved setup (arrangement, controlling computer and shared settings). */
+export interface ConfigView {
+  id: string;
+  name: string;
+  saved_ms: number;
+  /** Name of the computer it was saved on. */
+  saved_by: string;
+  members: { id: DeviceId; name: string; paired: boolean }[];
+  controller: DeviceId | null;
+  file: string;
+  includes_me: boolean;
+}
+
 export interface Snapshot {
   me: {
     id: DeviceId;
@@ -178,6 +198,11 @@ export interface Snapshot {
   max_devices: number;
   /** A search for devices on the network is running. */
   searching: boolean;
+  configs: ConfigView[];
+  /** Where saved configs are kept. */
+  configs_dir: string;
+  /** The saved config the current setup comes from (modified: changed since). */
+  current_config: { id: string; name: string; modified: boolean } | null;
 }
 
 export type Notice =
@@ -223,6 +248,8 @@ export interface Inspection {
   layout_screens: number | null;
   devices: { id: string; name: string }[];
   from_this_device: boolean;
+  /** The file is a saved config with this name. */
+  saved_config: string | null;
 }
 
 export interface AppInfo {
@@ -246,6 +273,7 @@ export const api = {
   pair: (device: DeviceId) => invoke<void>("pair", { device }),
   acceptPair: (device: DeviceId) => invoke<void>("accept_pair", { device }),
   rejectPair: (device: DeviceId) => invoke<void>("reject_pair", { device }),
+  setPairSettings: (device: DeviceId, from: DeviceId) => invoke<void>("set_pair_settings", { device, from }),
   unpair: (device: DeviceId) => invoke<void>("unpair", { device }),
   connectAddress: (address: string) => invoke<void>("connect_address", { address }),
   identify: () => invoke<void>("identify"),
@@ -266,6 +294,14 @@ export const api = {
   configImport: (path: string, password: string | null, options: ImportOptions) =>
     invoke<{ restarting: boolean }>("config_import", { path, password, options }),
   pendingConfigFile: () => invoke<string | null>("pending_config_file"),
+  saveConfig: (name: string, id: string | null) => invoke<void>("save_config", { name, id }),
+  renameConfig: (id: string, name: string) => invoke<void>("rename_config", { id, name }),
+  deleteConfig: (id: string) => invoke<void>("delete_config", { id }),
+  loadConfig: (id: string) => invoke<void>("load_config", { id }),
+  rescanConfigs: () => invoke<void>("rescan_configs"),
+  addConfigFile: (path: string) => invoke<void>("add_config_file", { path }),
+  exportConfigFile: (id: string, path: string) => invoke<void>("export_config_file", { id, path }),
+  openConfigsDir: () => invoke<void>("open_configs_dir"),
 };
 
 export function errorText(e: unknown): string {
