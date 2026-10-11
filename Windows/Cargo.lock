@@ -2241,7 +2241,7 @@ dependencies = [
 
 [[package]]
 name = "kvmbridge-core"
-version = "0.1.15"
+version = "1.0.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
