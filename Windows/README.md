@@ -1,8 +1,7 @@
 # KVM Bridge for Windows
 
 The Windows version of KVM Bridge, for 64-bit Windows 10 and 11. It works
-together with the Linux version; so far it has been tested with a Linux
-computer in control. What KVM Bridge does and how to use it is described in
+together with the Linux version. What KVM Bridge does and how to use it is described in
 the [main README](../README.md).
 
 ## Installing

@@ -37,7 +37,7 @@
     "shortDescription": "Share one keyboard and mouse, the clipboard and files between computers",
     "longDescription": "KVM Bridge lets several computers on the same network share a single keyboard and mouse. Move the cursor off the edge of one screen and it continues on the next computer. Clipboard contents and files (including drag and drop) move along, and all traffic is end-to-end encrypted with AES-256-GCM or ChaCha20-Poly1305.",
     "copyright": "KVM Bridge contributors",
-    "license": "MIT OR Apache-2.0",
+    "license": "Apache-2.0",
     "icon": [
       "../../Linux/src-tauri/icons/32x32.png",
       "../../Linux/src-tauri/icons/128x128.png",

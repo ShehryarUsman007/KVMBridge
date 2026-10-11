@@ -1,8 +1,7 @@
 # KVM Bridge for Linux
 
-The Linux version of KVM Bridge, for a GNOME 45 or newer session on Wayland.
-It has been tested on Ubuntu 24.04 and Fedora with GNOME; other desktops have
-not been tried. What KVM Bridge does and how to use it is described in the
+The Linux version of KVM Bridge, for a GNOME 45 or newer session on Wayland,
+such as Ubuntu 24.04 or Fedora. What KVM Bridge does and how to use it is described in the
 [main README](../README.md).
 
 This folder also holds the parts shared with the Windows version: the engine
