@@ -30,12 +30,24 @@
 //!   window never takes a drop, and it stays until a drag over it has ended,
 //!   so the button let go after Escape cannot drop the files anywhere else.
 //!
+//! * **Sending while this computer controls the others**: the input thread
+//!   says when input is taken with this computer's own left button held
+//!   ([`left_held_across`]). The same window then goes over all screens as a
+//!   *guard*, under the parked cursor, and a file drag in progress comes over
+//!   it and names its files. When the button is let go on the other screen,
+//!   the input thread lets it go here only once the drag is over the guard
+//!   (or a moment later), so the drag ends on the guard, which takes nothing:
+//!   the originals stay where they are. The engine's probe that follows gets
+//!   the files right away (there is no need to let go of input to read the
+//!   drag, as on Linux).
+//! * **A drag carried back here** (`StartDrag` with `after_release`): the
+//!   cursor came back with the left button pressed on another screen still
+//!   held. Windows never saw that press; when it is let go here
+//!   ([`carry_let_go`]) and the files are named, they are dropped under the
+//!   cursor like any received drag.
+//!
 //! While a drag runs, this thread only handles Windows' drag loop, so the
 //! engine's commands also leave a note in [`Signals`] that the drag reads.
-//!
-//! Not developed yet: dragging while this computer controls the others (a
-//! drag leaving it while input is taken, or one carried back to it). Those
-//! requests are declined, so nothing is dragged and nothing is dropped.
 
 use crate::clipboard::{global_bytes, hdrop_paths};
 use crate::{clipfmt, input};
@@ -45,7 +57,7 @@ use std::collections::VecDeque;
 use std::mem::ManuallyDrop;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, AtomicU8, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
@@ -79,6 +91,8 @@ pub enum Cmd {
 }
 
 const WM_APP_CMD: u32 = WM_APP + 1;
+/// The input thread has news about the left button ([`LEFT`], [`CARRY`]).
+const WM_APP_WAKE: u32 = WM_APP + 2;
 const TIMER_TICK: usize = 1;
 /// How often a drag or a probe in progress is looked after.
 const TICK_MS: u32 = 100;
@@ -100,6 +114,72 @@ const PROBE_MAX: Duration = Duration::from_secs(6);
 /// Longest wait for dropped files to arrive (the engine answers first when
 /// the transfer fails or is cancelled).
 const FILES_WAIT: Duration = Duration::from_secs(3600);
+/// Longest wait for a drag carried back here to be let go and named.
+const CARRY_MAX: Duration = Duration::from_secs(120);
+
+// ------------------------------------------------- news from the input thread
+
+/// This computer's own left button while it controls the others ([`LEFT`]).
+const LEFT_FREE: u8 = 0;
+/// Down when input was taken, and still held.
+const LEFT_ACROSS: u8 = 1;
+/// Let go on the other screen (and here).
+const LEFT_LET_GO: u8 = 2;
+static LEFT: AtomicU8 = AtomicU8::new(LEFT_FREE);
+
+/// A left button pressed on another screen and held on the way back ([`CARRY`]).
+const CARRY_NONE: u8 = 0;
+const CARRY_HELD: u8 = 1;
+const CARRY_LET_GO: u8 = 2;
+static CARRY: AtomicU8 = AtomicU8::new(CARRY_NONE);
+
+/// A drag is over the guard window right now (read by the input thread).
+static GUARD_OVER: AtomicBool = AtomicBool::new(false);
+/// This thread's command window (0 until it runs).
+static WINDOW: AtomicIsize = AtomicIsize::new(0);
+
+fn wake() {
+    let w = WINDOW.load(Ordering::Relaxed);
+    if w != 0 {
+        unsafe { PostMessageW(w as HWND, WM_APP_WAKE, 0, 0) };
+    }
+}
+
+/// Input was taken with this computer's own left button held: a drag of it
+/// may be leaving this screen.
+pub fn left_held_across() {
+    LEFT.store(LEFT_ACROSS, Ordering::Relaxed);
+    GUARD_OVER.store(false, Ordering::Relaxed);
+    wake();
+}
+
+/// That button was let go (on the other screen, and now here).
+pub fn left_let_go() {
+    LEFT.store(LEFT_LET_GO, Ordering::Relaxed);
+    wake();
+}
+
+/// Input came back with that button still held: a drag of it carries on here.
+pub fn left_back_home() {
+    let _ = LEFT.compare_exchange(LEFT_ACROSS, LEFT_FREE, Ordering::Relaxed, Ordering::Relaxed);
+    wake();
+}
+
+/// A drag is over the guard window, so letting go of the button ends it there.
+pub fn guard_over() -> bool {
+    GUARD_OVER.load(Ordering::Relaxed)
+}
+
+/// Input came back with a left button pressed on another screen still held.
+pub fn carry_held() {
+    CARRY.store(CARRY_HELD, Ordering::Relaxed);
+}
+
+/// That button was let go here.
+pub fn carry_let_go() {
+    CARRY.store(CARRY_LET_GO, Ordering::Relaxed);
+    wake();
+}
 
 /// Starts the backend: its thread, fed with the engine's commands. Needs a
 /// tokio runtime.
@@ -230,6 +310,8 @@ struct State {
     waiting: u32,
     /// Drags that start once the one going on is over.
     deferred: VecDeque<DndCommand>,
+    /// A drag carried back here, waiting to be let go and named.
+    carry: Option<Carry>,
     ticking: bool,
 }
 
@@ -257,12 +339,26 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             run_commands();
             0
         }
+        WM_APP_WAKE => {
+            look_after_guard();
+            look_after_carry();
+            0
+        }
         WM_TIMER if wparam == TIMER_TICK => {
             tick();
             0
         }
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
     }
+}
+
+unsafe extern "system" fn probe_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if msg == WM_SETCURSOR && input::taken() {
+        // The parked cursor stays hidden while the guard is over it.
+        unsafe { SetCursor(std::ptr::null_mut()) };
+        return 1;
+    }
+    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
 
 unsafe extern "system" fn grab_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -308,7 +404,7 @@ fn create_windows() -> Result<(HWND, HWND, HWND), String> {
     wc.lpfnWndProc = Some(grab_proc);
     wc.lpszClassName = grab_class.as_ptr();
     unsafe { RegisterClassExW(&wc) };
-    wc.lpfnWndProc = Some(DefWindowProcW);
+    wc.lpfnWndProc = Some(probe_proc);
     wc.lpszClassName = probe_class.as_ptr();
     unsafe { RegisterClassExW(&wc) };
 
@@ -379,10 +475,14 @@ fn thread_main(rx: mpsc::Receiver<Cmd>, events: Events, signals: Arc<Signals>, r
         in_drag: false,
         waiting: 0,
         deferred: VecDeque::new(),
+        carry: None,
         ticking: false,
     };
     STATE.with(|s| *s.borrow_mut() = Some(state));
+    WINDOW.store(hwnd as isize, Ordering::Relaxed);
     let _ = ready.send(Ok(hwnd as isize));
+    // Input may have been taken with the button held before this ran.
+    look_after_guard();
 
     let mut msg: MSG = unsafe { std::mem::zeroed() };
     while unsafe { GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) } > 0 {
@@ -392,6 +492,7 @@ fn thread_main(rx: mpsc::Receiver<Cmd>, events: Events, signals: Arc<Signals>, r
         }
     }
 
+    let _ = WINDOW.compare_exchange(hwnd as isize, 0, Ordering::Relaxed, Ordering::Relaxed);
     if let Some(s) = STATE.with(|s| s.borrow_mut().take()) {
         if let Some(d) = &s.drag {
             d.stop();
@@ -440,14 +541,34 @@ fn on_command(cmd: DndCommand) {
     match cmd {
         DndCommand::Probe { probe, .. } => start_probe(probe),
         DndCommand::ProbeDone { probe, outcome } => probe_done(probe, outcome),
-        DndCommand::StartDrag { drag, after_release: true, .. } => {
-            tracing::info!("dragging files onto this computer while it controls the others is not developed yet; nothing is dropped");
-            with_state(|s| s.events.send(DndEvent::DragEnded { drag, accepted: false }));
+        DndCommand::StartDrag { drag, drop_after_ms, after_release: true, .. } => {
+            // The engine gave up on any earlier one already.
+            let released = CARRY.compare_exchange(CARRY_LET_GO, CARRY_NONE, Ordering::Relaxed, Ordering::Relaxed).is_ok();
+            tracing::info!("the cursor came back with the button held; files dragged over there are dropped where it is let go");
+            with_state(|s| {
+                s.carry = Some(Carry { drag, names: None, drop_after_ms, released, since: Instant::now() });
+            });
+            ensure_tick();
+            look_after_carry();
         }
         DndCommand::StartDrag { .. } => start_drag(cmd),
-        // Only for drags carried back to this computer (see above).
-        DndCommand::DragFiles { .. } => {}
+        DndCommand::DragFiles { drag, names } => {
+            let known = with_state(|s| match s.carry.as_mut().filter(|c| c.drag == drag) {
+                Some(c) => {
+                    c.names = Some(names);
+                    true
+                }
+                None => false,
+            });
+            if known == Some(true) {
+                look_after_carry();
+            }
+        }
         DndCommand::CancelDrag { drag } => {
+            let carried = with_state(|s| s.carry.take_if(|c| c.drag == drag).is_some());
+            if carried == Some(true) {
+                tracing::info!("nothing is dropped here: the drag over there carried no files, or it was called off");
+            }
             let Some(d) = with_state(|s| {
                 s.deferred.retain(|c| !matches!(c, DndCommand::StartDrag { drag: d, .. } if *d == drag));
                 s.drag.clone().filter(|d| d.id == drag)
@@ -495,12 +616,12 @@ fn tick() {
     }
     let mut empty = None;
     let mut hide = false;
-    if let Some(r) = probe.borrow_mut().as_mut() {
-        if !r.reported && r.started.elapsed() >= PROBE_WAIT {
+    if let Some(r) = probe.borrow_mut().as_mut().filter(|r| !r.guard) {
+        if !r.reported && r.asked.elapsed() >= PROBE_WAIT {
             r.reported = true;
-            empty = Some(r.id);
+            empty = r.id;
         }
-        hide = r.done_at.is_some_and(|t| !r.over || t.elapsed() >= PROBE_LINGER) || r.started.elapsed() >= PROBE_MAX;
+        hide = r.done_at.is_some_and(|t| !r.over || t.elapsed() >= PROBE_LINGER) || r.asked.elapsed() >= PROBE_MAX;
     }
     if let Some(id) = empty {
         tracing::info!("drag probe: no drag came over the probe window");
@@ -509,9 +630,11 @@ fn tick() {
     if hide {
         hide_probe();
     }
+    look_after_guard();
+    look_after_carry();
     let busy = drag.is_some_and(|d| d.awaiting_press());
     with_state(|s| {
-        if !busy && s.grab_hide_at.is_none() && s.probe.borrow().is_none() {
+        if !busy && s.grab_hide_at.is_none() && s.probe.borrow().is_none() && s.carry.is_none() {
             s.ticking = false;
             unsafe { KillTimer(s.hwnd, TIMER_TICK) };
         }
@@ -923,9 +1046,16 @@ impl IDataObject_Impl for DataObject_Impl {
 
 // ------------------------------------------------------------------ sending
 
+/// The probe window at work: a probe on a computer controlled from another
+/// one, or a guard (see the module documentation).
 struct ProbeRun {
-    id: u64,
-    started: Instant,
+    /// The engine's probe (a guard gets one once the button is let go).
+    id: Option<u64>,
+    /// When the engine asked.
+    asked: Instant,
+    guard: bool,
+    /// The files of the drag that came over the window (guard).
+    paths: Option<Vec<PathBuf>>,
     /// The engine has its answer.
     reported: bool,
     /// A drag is over the window right now.
@@ -933,39 +1063,67 @@ struct ProbeRun {
     /// The engine is done with the probe: the window goes once no drag is
     /// over it (or after [`PROBE_LINGER`]).
     done_at: Option<Instant>,
+    /// Guard: when the button was seen let go.
+    let_go_at: Option<Instant>,
+    /// The window is on screen.
+    shown: bool,
 }
 
-/// Put the probe window over all screens and wait for a drag to come over it.
+/// The engine asks what is being dragged off this screen. While this
+/// computer controls the others, the guard has the answer (or gets it in a
+/// moment); otherwise the probe window goes over all screens and the engine
+/// moves the pointer onto it.
 fn start_probe(id: u64) {
     let Some((events, window, probe)) = with_state(|s| (s.events.clone(), s.window, s.probe.clone())) else { return };
-    if input::taken() {
-        tracing::info!("dragging files off this computer while it controls the others is not developed yet");
-        let _ = events.send(DndEvent::Probed { probe: id, paths: vec![], dragging: false });
-        return;
+    let guarded = probe.borrow_mut().as_mut().filter(|r| r.guard && r.id.is_none()).map(|r| {
+        r.id = Some(id);
+        r.asked = Instant::now();
+        r.paths.clone()
+    });
+    match guarded {
+        Some(Some(paths)) => {
+            if let Some(r) = probe.borrow_mut().as_mut() {
+                r.reported = true;
+            }
+            tracing::info!("the drag that left this screen carries {} item(s)", paths.len());
+            let _ = events.send(DndEvent::Probed { probe: id, paths, dragging: false });
+            look_after_guard();
+        }
+        Some(None) => {
+            // It may still come over the guard (see the input thread).
+            ensure_tick();
+        }
+        None if input::taken() => {
+            tracing::info!("no drag from this screen is under the cursor");
+            let _ = events.send(DndEvent::Probed { probe: id, paths: vec![], dragging: false });
+        }
+        None => {
+            *probe.borrow_mut() = Some(ProbeRun {
+                id: Some(id),
+                asked: Instant::now(),
+                guard: false,
+                paths: None,
+                reported: false,
+                over: false,
+                done_at: None,
+                let_go_at: None,
+                shown: true,
+            });
+            show_probe_window(window);
+            let _ = events.send(DndEvent::ProbeReady { probe: id });
+            ensure_tick();
+        }
     }
-    *probe.borrow_mut() = Some(ProbeRun { id, started: Instant::now(), reported: false, over: false, done_at: None });
-    unsafe {
-        SetWindowPos(
-            window,
-            HWND_TOPMOST,
-            GetSystemMetrics(SM_XVIRTUALSCREEN),
-            GetSystemMetrics(SM_YVIRTUALSCREEN),
-            GetSystemMetrics(SM_CXVIRTUALSCREEN),
-            GetSystemMetrics(SM_CYVIRTUALSCREEN),
-            SWP_NOACTIVATE | SWP_SHOWWINDOW,
-        )
-    };
-    let _ = events.send(DndEvent::ProbeReady { probe: id });
-    ensure_tick();
 }
 
 fn probe_done(id: u64, outcome: ProbeOutcome) {
     let Some(probe) = with_state(|s| s.probe.clone()) else { return };
     let hide = match probe.borrow_mut().as_mut() {
-        Some(r) if r.id == id => {
+        Some(r) if r.id == Some(id) => {
             tracing::debug!("drag probe finished ({outcome:?})");
             r.done_at = Some(Instant::now());
-            !r.over
+            r.reported = true;
+            !r.guard && !r.over
         }
         _ => false,
     };
@@ -977,8 +1135,168 @@ fn probe_done(id: u64, outcome: ProbeOutcome) {
 fn hide_probe() {
     with_state(|s| {
         unsafe { ShowWindow(s.window, SW_HIDE) };
+        GUARD_OVER.store(false, Ordering::Relaxed);
         s.probe.borrow_mut().take();
     });
+}
+
+/// Puts the probe window over all screens.
+fn show_probe_window(window: HWND) {
+    unsafe {
+        SetWindowPos(
+            window,
+            HWND_TOPMOST,
+            GetSystemMetrics(SM_XVIRTUALSCREEN),
+            GetSystemMetrics(SM_YVIRTUALSCREEN),
+            GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            GetSystemMetrics(SM_CYVIRTUALSCREEN),
+            SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        )
+    };
+}
+
+/// The guard (see the module documentation): up while this computer's own
+/// left button is held across the edge; after it is let go, until the drag
+/// over it has ended; and its run is kept until the engine's probe has its
+/// answer.
+fn look_after_guard() {
+    let Some((events, window, probe)) = with_state(|s| (s.events.clone(), s.window, s.probe.clone())) else { return };
+    let left = LEFT.load(Ordering::Relaxed);
+    // Nothing can be dragging without the button down as far as Windows
+    // knows (the guard takes every click while it is up).
+    let down = left_button_down();
+    let mut run = probe.borrow_mut();
+    let guarding = run.as_ref().is_some_and(|r| r.guard);
+    if left == LEFT_ACROSS && down && !run.as_ref().is_some_and(|r| r.guard && r.shown && r.id.is_none()) {
+        // A new crossing with the button held. Anything still waiting on the
+        // window is over.
+        if let Some(old) = run.take().filter(|r| !r.reported) {
+            if let Some(id) = old.id {
+                let _ = events.send(DndEvent::Probed { probe: id, paths: vec![], dragging: false });
+            }
+        }
+        *run = Some(ProbeRun {
+            id: None,
+            asked: Instant::now(),
+            guard: true,
+            paths: None,
+            reported: false,
+            over: false,
+            done_at: None,
+            let_go_at: None,
+            shown: true,
+        });
+        drop(run);
+        GUARD_OVER.store(false, Ordering::Relaxed);
+        show_probe_window(window);
+        tracing::info!("the button is held while the cursor is on another screen; a drag from here is caught by the guard window");
+        // A drag in progress only looks again when the pointer moves.
+        input::nudge();
+        ensure_tick();
+        return;
+    }
+    if !guarding {
+        return;
+    }
+    let Some(r) = run.as_mut() else { return };
+    let mut empty = None;
+    let mut hide = false;
+    if r.shown {
+        hide = match left {
+            LEFT_ACROSS => !down,
+            LEFT_LET_GO => {
+                let t = *r.let_go_at.get_or_insert_with(Instant::now);
+                !r.over || t.elapsed() >= PROBE_LINGER
+            }
+            // Back with the button held: the drag carries on here.
+            _ => true,
+        };
+        if hide {
+            r.shown = false;
+            r.over = false;
+            GUARD_OVER.store(false, Ordering::Relaxed);
+        }
+    }
+    if let Some(id) = r.id.filter(|_| !r.reported && r.asked.elapsed() >= PROBE_WAIT) {
+        r.reported = true;
+        empty = Some(id);
+    }
+    // Kept for the engine's probe, which follows the button let go.
+    let awaited = match r.id {
+        Some(_) => !r.reported,
+        None => left == LEFT_LET_GO && r.let_go_at.is_none_or(|t| t.elapsed() < PROBE_MAX),
+    };
+    let forget = !r.shown && !awaited;
+    if forget {
+        *run = None;
+    }
+    drop(run);
+    if hide {
+        unsafe { ShowWindow(window, SW_HIDE) };
+    }
+    if let Some(id) = empty {
+        tracing::info!("drag probe: no file drag came over the guard window");
+        let _ = events.send(DndEvent::Probed { probe: id, paths: vec![], dragging: false });
+    }
+}
+
+/// The left (primary) button is down as far as Windows knows.
+fn left_button_down() -> bool {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON, VK_RBUTTON};
+    let vk = if unsafe { GetSystemMetrics(SM_SWAPBUTTON) } != 0 { VK_RBUTTON } else { VK_LBUTTON };
+    unsafe { GetAsyncKeyState(vk as i32) as u16 & 0x8000 != 0 }
+}
+
+/// A drag carried back here starts once its button is let go and its files
+/// are named.
+fn look_after_carry() {
+    let Some(Some((drag, released, named, since))) =
+        with_state(|s| s.carry.as_ref().map(|c| (c.drag, c.released, c.names.is_some(), c.since)))
+    else {
+        return;
+    };
+    let released = released
+        || CARRY.compare_exchange(CARRY_LET_GO, CARRY_NONE, Ordering::Relaxed, Ordering::Relaxed).is_ok_and(|_| {
+            tracing::info!("the button was let go here");
+            true
+        });
+    if since.elapsed() >= CARRY_MAX {
+        tracing::info!("the drag carried back here was not let go and named in time; nothing is dropped");
+        with_state(|s| {
+            s.carry = None;
+            let _ = s.events.send(DndEvent::DragEnded { drag, accepted: false });
+        });
+        return;
+    }
+    if !(released && named) {
+        with_state(|s| {
+            if let Some(c) = s.carry.as_mut() {
+                c.released = released;
+            }
+        });
+        return;
+    }
+    let Some(Some(c)) = with_state(|s| s.carry.take()) else { return };
+    with_state(|s| s.signals.latest.store(drag, Ordering::Relaxed));
+    let names = c.names.unwrap_or_default();
+    start_drag(DndCommand::StartDrag {
+        drag,
+        names,
+        pos: kvmbridge_core::types::Point::default(),
+        drop_after_ms: c.drop_after_ms,
+        after_release: false,
+    });
+}
+
+/// A drag carried back here: see [`look_after_carry`].
+struct Carry {
+    drag: u64,
+    /// Named by the computer it comes from (`None` until then).
+    names: Option<Vec<String>>,
+    drop_after_ms: u64,
+    /// Its button was let go here.
+    released: bool,
+    since: Instant,
 }
 
 /// The files a drag carries (none if it carries no real files).
@@ -1016,9 +1334,19 @@ impl IDropTarget_Impl for ProbeTarget_Impl {
         };
         if let Some(r) = self.run.borrow_mut().as_mut() {
             r.over = true;
-            if !std::mem::replace(&mut r.reported, true) {
-                tracing::info!("a drag leaving this screen carries {} item(s)", paths.len());
-                let _ = self.events.send(DndEvent::Probed { probe: r.id, paths, dragging: true });
+            if r.guard {
+                GUARD_OVER.store(true, Ordering::Relaxed);
+                if r.paths.is_none() {
+                    tracing::info!("the guard window: the drag here carries {} item(s)", paths.len());
+                    r.paths = Some(paths.clone());
+                }
+            }
+            if let Some(id) = r.id.filter(|_| !r.reported) {
+                r.reported = true;
+                if !r.guard {
+                    tracing::info!("a drag leaving this screen carries {} item(s)", paths.len());
+                }
+                let _ = self.events.send(DndEvent::Probed { probe: id, paths, dragging: !r.guard });
             }
         }
         offer_copy(effect);
@@ -1026,6 +1354,12 @@ impl IDropTarget_Impl for ProbeTarget_Impl {
     }
 
     fn DragOver(&self, _: MODIFIERKEYS_FLAGS, _: &POINTL, effect: *mut DROPEFFECT) -> OleResult<()> {
+        if let Some(r) = self.run.borrow_mut().as_mut() {
+            r.over = true;
+            if r.guard {
+                GUARD_OVER.store(true, Ordering::Relaxed);
+            }
+        }
         offer_copy(effect);
         Ok(())
     }
@@ -1034,6 +1368,7 @@ impl IDropTarget_Impl for ProbeTarget_Impl {
         if let Some(r) = self.run.borrow_mut().as_mut() {
             r.over = false;
         }
+        GUARD_OVER.store(false, Ordering::Relaxed);
         Ok(())
     }
 
@@ -1041,6 +1376,7 @@ impl IDropTarget_Impl for ProbeTarget_Impl {
         if let Some(r) = self.run.borrow_mut().as_mut() {
             r.over = false;
         }
+        GUARD_OVER.store(false, Ordering::Relaxed);
         tracing::info!("a drag was let go over the probe window; nothing was dropped");
         if let Some(e) = unsafe { effect.as_mut() } {
             *e = DROPEFFECT_NONE;

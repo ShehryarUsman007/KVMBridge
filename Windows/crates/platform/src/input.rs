@@ -26,6 +26,15 @@
 //! * hooks end with the process, so quitting or a crash frees input;
 //! * input is never given back with the cursor on the edge that takes it
 //!   (and taking it needs a push outwards, never a move along or away).
+//!
+//! Drag and drop (see [`crate::dnd`]): a left button held while input is
+//! taken may be dragging files off this screen. The drag-and-drop thread is
+//! told, and puts a window that never takes a drop under the parked cursor;
+//! letting go of the button on the other screen lets go of it here only
+//! once the drag is over that window (a moment later at most), so nothing
+//! is dropped here. A left button pressed on another screen and still held
+//! when the cursor comes back was never seen by Windows: letting go of it
+//! tells the drag-and-drop thread, which drops the files dragged over there.
 
 use crate::edges;
 use crate::emulation::TAG;
@@ -36,7 +45,7 @@ use kvmbridge_core::platform::{BackendStatus, CaptureEvent, EmulationEvent, Guar
 use kvmbridge_core::types::{buttons, Edge, Point};
 use std::cell::RefCell;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
@@ -61,8 +70,15 @@ pub enum Cmd {
 }
 
 const WM_APP_CMD: u32 = WM_APP + 1;
+/// Move the parked cursor a pixel and back (a drag in progress looks again
+/// at what is under it).
+const WM_APP_NUDGE: u32 = WM_APP + 2;
 const TIMER_WATCH: usize = 1;
 const TIMER_TAKE: usize = 2;
+const TIMER_UP: usize = 3;
+/// How long a left button let go on another screen is held back here when
+/// a drag of it was not over the drag-and-drop thread's window yet.
+const UP_AFTER_MS: u32 = 200;
 const WATCH_EVERY_MS: u32 = 250;
 /// How long the cursor waits at the edge before it is parked: the engine
 /// gives input straight back within milliseconds if nothing is reachable.
@@ -79,6 +95,30 @@ static TAKEN: AtomicBool = AtomicBool::new(false);
 /// This computer's mouse and keyboard are taken for another screen.
 pub fn taken() -> bool {
     TAKEN.load(Ordering::Relaxed)
+}
+
+/// The input thread's window (0 until it runs).
+static WINDOW: AtomicIsize = AtomicIsize::new(0);
+
+/// Moves the parked cursor a pixel and back, so a drag in progress here sees
+/// what is under it now (for the drag-and-drop thread).
+pub(crate) fn nudge() {
+    let w = WINDOW.load(Ordering::Relaxed);
+    if w != 0 {
+        unsafe { PostMessageW(w as HWND, WM_APP_NUDGE, 0, 0) };
+    }
+}
+
+/// Lets go of the left button through SendInput (tagged, so the hooks let it
+/// through).
+fn inject_left_up() {
+    let input = INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT { dx: 0, dy: 0, mouseData: 0, dwFlags: MOUSEEVENTF_LEFTUP, time: 0, dwExtraInfo: TAG },
+        },
+    };
+    unsafe { SendInput(1, &input, std::mem::size_of::<INPUT>() as i32) };
 }
 
 /// Handle to the input thread.
@@ -141,6 +181,15 @@ struct State {
     pass_buttons: HashSet<u32>,
     /// Keys reported as pressed (drops auto-repeat).
     sent_keys: HashSet<u32>,
+    /// The left button was down when input was taken, and is not let go
+    /// here yet (it may be dragging files off this screen).
+    left_across: bool,
+    /// It was let go on the other screen, and is let go here once a drag of
+    /// it is over the drag-and-drop thread's window ([`TIMER_UP`]).
+    pending_up: bool,
+    /// The left button was pressed on another screen and is still held:
+    /// Windows never saw it go down.
+    carried_left: bool,
     /// Moves against an edge that left the cursor where it was.
     still_pushes: u32,
     cooldown: Option<(Edge, Instant)>,
@@ -260,12 +309,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             with_state(State::run_commands);
             0
         }
+        WM_APP_NUDGE => {
+            with_state(|s| s.nudge());
+            0
+        }
         WM_TIMER => {
-            if wparam == TIMER_TAKE {
-                with_state(State::park);
-            } else {
-                with_state(State::watch);
-            }
+            match wparam {
+                TIMER_TAKE => with_state(State::park),
+                TIMER_UP => with_state(State::let_go_left),
+                _ => with_state(State::watch),
+            };
             0
         }
         WM_DISPLAYCHANGE => {
@@ -351,6 +404,7 @@ fn thread_main(
         }
     };
     unsafe { WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) };
+    WINDOW.store(hwnd as isize, Ordering::Relaxed);
     let hooks = install_hooks();
     let state = State {
         cap,
@@ -369,6 +423,9 @@ fn thread_main(
         pass_keys: HashSet::new(),
         pass_buttons: HashSet::new(),
         sent_keys: HashSet::new(),
+        left_across: false,
+        pending_up: false,
+        carried_left: false,
         still_pushes: 0,
         cooldown: None,
         ticks: 0,
@@ -395,6 +452,7 @@ fn thread_main(
         }
     }
 
+    let _ = WINDOW.compare_exchange(hwnd as isize, 0, Ordering::Relaxed, Ordering::Relaxed);
     if let Some(s) = STATE.with(|s| s.borrow_mut().take()) {
         if let Some((m, k)) = s.hooks {
             unsafe {
@@ -451,6 +509,13 @@ impl State {
                     // that was down when the pause began.
                     return !matches!(button, Some((b, false)) if self.pass_buttons.remove(&b));
                 }
+                if button == Some((buttons::BTN_LEFT, false)) && std::mem::take(&mut self.carried_left) {
+                    // Pressed on another screen and held on the way back:
+                    // Windows never saw it go down. Files dragged over there
+                    // are dropped here now.
+                    crate::dnd::carry_let_go();
+                    return true;
+                }
                 if msg == WM_MOUSEMOVE && self.enabled {
                     return self.check_push(info.pt);
                 }
@@ -479,9 +544,27 @@ impl State {
             _ => match button {
                 Some((b, pressed)) => {
                     self.emit(CaptureEvent::Button { button: b, pressed });
+                    if b == buttons::BTN_LEFT && !pressed {
+                        self.carried_left = false;
+                    }
+                    if pressed || !self.pass_buttons.remove(&b) {
+                        return true;
+                    }
                     // A button that was down when input was taken is let go
-                    // here too (the engine may also start a drag with it).
-                    !(!pressed && self.pass_buttons.remove(&b))
+                    // here too (this computer saw it go down; the engine may
+                    // also start a drag with it).
+                    if b == buttons::BTN_LEFT && std::mem::take(&mut self.left_across) {
+                        if !crate::dnd::guard_over() {
+                            // A drag of it may not be over the window that
+                            // takes no drop yet: it gets a moment to come.
+                            self.pending_up = true;
+                            self.nudge();
+                            unsafe { SetTimer(self.hwnd, TIMER_UP, UP_AFTER_MS, None) };
+                            return true;
+                        }
+                        crate::dnd::left_let_go();
+                    }
+                    false
                 }
                 None => true,
             },
@@ -569,6 +652,14 @@ impl State {
         self.still_pushes = 0;
         self.pass_keys = self.down_keys.clone();
         self.pass_buttons = self.down_buttons.clone();
+        if self.carried_left {
+            // Windows never saw it go down.
+            self.pass_buttons.remove(&buttons::BTN_LEFT);
+        }
+        self.left_across = self.pass_buttons.contains(&buttons::BTN_LEFT);
+        if self.left_across {
+            crate::dnd::left_held_across();
+        }
         self.sent_keys.clear();
         self.emit(CaptureEvent::Activated { edge, pos: to_point(at) });
         unsafe { SetTimer(self.hwnd, TIMER_TAKE, TAKE_AFTER_MS, None) };
@@ -605,6 +696,19 @@ impl State {
             Mode::Taking { edge, at, .. } => (edge, at, false),
             Mode::Held { edge, at, .. } => (edge, at, true),
         };
+        // Let go of a button let go on the other screen first, while the
+        // window that takes no drop is still under the cursor.
+        self.let_go_left();
+        if std::mem::take(&mut self.left_across) {
+            // Back here with the button still held: a drag carries on here.
+            crate::dnd::left_back_home();
+        }
+        if self.down_buttons.contains(&buttons::BTN_LEFT) && !self.pass_buttons.contains(&buttons::BTN_LEFT) {
+            // Pressed on another screen and still held: files dragged there
+            // may follow, and are dropped when it is let go here.
+            self.carried_left = true;
+            crate::dnd::carry_held();
+        }
         self.mode = Mode::Free;
         TAKEN.store(false, Ordering::Relaxed);
         self.still_pushes = 0;
@@ -625,6 +729,32 @@ impl State {
             }
         };
         unsafe { SetCursorPos(to.x, to.y) };
+    }
+
+    /// Moves the cursor a pixel into the screen and back, while input is
+    /// taken: a drag in progress here sees what is under it now.
+    fn nudge(&self) {
+        let (p, edge) = match self.mode {
+            Mode::Free => return,
+            Mode::Taking { cursor, edge, .. } => (cursor, edge),
+            Mode::Held { park, edge, .. } => (park, edge),
+        };
+        let q = inset(p, edge, 1);
+        unsafe {
+            SetCursorPos(q.x, q.y);
+            SetCursorPos(p.x, p.y);
+        }
+    }
+
+    /// Lets go of a left button let go on the other screen and held back here
+    /// for a moment (see [`Self::on_mouse`]).
+    fn let_go_left(&mut self) {
+        if !std::mem::take(&mut self.pending_up) {
+            return;
+        }
+        unsafe { KillTimer(self.hwnd, TIMER_UP) };
+        inject_left_up();
+        crate::dnd::left_let_go();
     }
 
     /// Input is given back on this computer's own initiative.
@@ -653,6 +783,7 @@ impl State {
         self.give_back("another computer controls this one now");
         self.pass_keys = self.down_keys.clone();
         self.pass_buttons = self.down_buttons.clone();
+        self.carried_left = false;
         self.blocking = true;
         self.emit(CaptureEvent::Guard(GuardStatus::Paused(device_count())));
     }

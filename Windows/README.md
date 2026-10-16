@@ -34,9 +34,8 @@ and mouse are paused; no extra setup is needed for that on Windows.
 
 ## Things to know
 
-* Dragging files across a screen edge works while another computer is in
-  control. Dragging files while this Windows computer controls the others is
-  not supported yet; copy and paste or **Send files** work instead.
+* Dragging files across a screen edge works both ways, whichever computer is
+  in control.
 * Settings, pairings and saved configs live in
   `%APPDATA%\kvmbridge\KVMBridge\config` (saved configs in its `configs`
   folder), logs in `%LOCALAPPDATA%\kvmbridge\KVMBridge\cache\logs`.
